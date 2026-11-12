@@ -22,7 +22,7 @@ struct Http {
 struct Server {
     bool https = false;
     std::string host = "127.0.0.1";
-    int port = 8000;
+    int port = 8188;
     std::string apiKey;  // Comfy Cloud only (never sent to redirect targets)
     bool cloud = false;  // Comfy Cloud job/status routes
 

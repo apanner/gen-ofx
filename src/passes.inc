@@ -82,13 +82,21 @@
             const Frame* f = frames(s + k);
             Gray sel, oth, plain;
             if (!f) return c.fail("could not read the input frames");
-            if (!readPFM(matteFile(j.dir, selKind(obj).c_str(), s + k), sel) ||
-                !readPFM(matteFile(j.dir, othKind(obj).c_str(), s + k), oth))
+            if (!readPFM(matteFile(j.dir, selKind(obj).c_str(), s + k), sel))
                 return c.fail("selection cache missing");
+            readPFM(matteFile(j.dir, othKind(obj).c_str(), s + k), oth);
             readPFM(matteFile(j.dir, "ag", s + k), plain);
             Gray hole, comp;
-            cleanMasks(f->w, f->h, sel, oth, plain.px.empty() ? nullptr : &plain, hole, comp);
-            guideF[k] = isolatedGuide(*f, sel, hole, false);
+            if (j.cleanPlateOnly) {
+                const double scale = f->w / 1920.0;
+                hole = growBlur(sel, std::max(2, (int)std::lround(8 * scale)), 0.0);
+                comp = growBlur(hole, std::max(1, (int)std::lround(4 * scale)), 3.0 * scale + 0.5);
+                Gray emptySel = blankLike(sel);
+                guideF[k] = isolatedGuide(*f, emptySel, hole, false);
+            } else {
+                cleanMasks(f->w, f->h, sel, oth, plain.px.empty() ? nullptr : &plain, hole, comp);
+                guideF[k] = isolatedGuide(*f, sel, hole, false);
+            }
             holeF[k] = grayFrame(hole);
             compF[k] = grayFrame(comp);
         }
@@ -168,6 +176,20 @@
     };
 
     if (chunks > 0) {
+        if (j.cleanPlateOnly) {
+            std::string info;
+            for (int k = 0; k < K; ++k) {
+                std::ofstream(j.dir / strf("pass2_%d.txt", k)) << "clean";
+                info += (info.empty() ? "" : "; ") + j.objects[k].label() + ": clean plate";
+                for (int ci = 0; ci < chunks; ++ci) {
+                    if (!runClean(ci, k, wTrack + wAG * ci / chunks, wAG / chunks)) return c.res;
+                }
+            }
+            c.res.info = info;
+            c.res.ok = true;
+            return c.res;
+        }
+
         const bool clean = K > 0 && j.mode == kClean;
         const bool twoPass = K > 0 && (j.mode == kAuto || j.mode == kIsolate || j.mode == kSteer || clean);
         // who gets a pass 2: every output object; in clean mode also any other selected

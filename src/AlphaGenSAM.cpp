@@ -91,12 +91,13 @@ static const float kTint[12][3] = {{0.2f, 1.f, 0.3f},  {1.f, 0.6f, 0.1f},  {0.2f
 
 struct Instance {
     bool isCleanGen = false;
+    std::string nodeName;
     OfxImageClipHandle src = nullptr, dst = nullptr;
     OfxParamHandle select, points, autoPreview, rangeMode, frameStart, frameEnd, show, debug, status;
     OfxParamHandle mode, workRes, chunk, blend, seed, colour, detThresh, others, reach, blackPt, whitePt;
     OfxParamHandle backend, cloudKey, serverUrl, samModel, unetModel, icLora, textEnc, videoVae, audioVae, cacheDir;
     OfxParamHandle session, anaStart, anaCount, cacheVersion;
-    OfxParamHandle exportDir, spitRead, autoRead;
+    OfxParamHandle outputPath, detectPath, exportDir, spitRead, autoRead;
 
     // viewer drag state (lives on the effect instance, shared by its overlay)
     int dragIndex = -1;
@@ -107,20 +108,97 @@ struct Instance {
     std::vector<std::string> order;
 };
 
-// ----------------------------------------------------------------- helpers
+// ----------------------------------------------------------------- settings persistence (~/.nuke/gentools_settings.json)
 
-static std::string evaluateNukePath(const std::string& raw) {
-    if (raw.empty()) return "";
-    if (raw.find('[') == std::string::npos) return raw;
+struct GenToolsSettings {
+    int backend = kBackendLocal;  // 0 = local, 1 = cloud
+    std::string serverUrl = "http://127.0.0.1:8188";
+    std::string cloudKey = "";
+    int autoRead = 1;
+};
+
+static fs::path getSettingsFilePath() {
+    wchar_t* userProfile = nullptr;
+    size_t n = 0;
+    if (_wdupenv_s(&userProfile, &n, L"USERPROFILE") == 0 && userProfile) {
+        fs::path p = fs::path(userProfile) / ".nuke" / "gentools_settings.json";
+        free(userProfile);
+        return p;
+    }
+    return fs::path("gentools_settings.json");
+}
+
+static GenToolsSettings loadSettings() {
+    GenToolsSettings s;
+    fs::path p = getSettingsFilePath();
+    std::ifstream f(p);
+    if (f) {
+        std::string str((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        json::Value root;
+        if (json::parse(str, root) && root.type == json::Value::Object) {
+            if (root.has("backend")) s.backend = (int)root["backend"].num(kBackendLocal);
+            if (root.has("serverUrl") && !root["serverUrl"].str().empty()) s.serverUrl = root["serverUrl"].str();
+            if (root.has("cloudKey")) s.cloudKey = root["cloudKey"].str();
+            if (root.has("autoRead")) s.autoRead = (int)root["autoRead"].num(1);
+        }
+    }
+    return s;
+}
+
+static void saveSettings(const GenToolsSettings& s) {
+    fs::path p = getSettingsFilePath();
+    std::error_code ec;
+    fs::create_directories(p.parent_path(), ec);
+    std::ofstream f(p);
+    if (f) {
+        f << "{\n"
+          << "  \"backend\": " << s.backend << ",\n"
+          << "  \"serverUrl\": \"" << s.serverUrl << "\",\n"
+          << "  \"cloudKey\": \"" << s.cloudKey << "\",\n"
+          << "  \"autoRead\": " << s.autoRead << "\n"
+          << "}\n";
+    }
+}
+
+// ----------------------------------------------------------------- Python in Nuke execution
+
+static bool runPythonScript(const std::string& pyCode, std::string& err) {
     HMODULE hPy = GetModuleHandleA("python310.dll");
     if (!hPy) hPy = GetModuleHandleA("python311.dll");
     if (!hPy) hPy = GetModuleHandleA("python39.dll");
     if (!hPy) hPy = GetModuleHandleA("python3.dll");
-    if (!hPy) return raw;
+    if (!hPy) {
+        err = "Could not find Nuke Python runtime DLL.";
+        return false;
+    }
 
     typedef int (*PyRun_SimpleString_t)(const char*);
+    typedef int (*PyGILState_Ensure_t)();
+    typedef void (*PyGILState_Release_t)(int);
+
     auto PyRun = (PyRun_SimpleString_t)GetProcAddress(hPy, "PyRun_SimpleString");
-    if (!PyRun) return raw;
+    auto PyEnsure = (PyGILState_Ensure_t)GetProcAddress(hPy, "PyGILState_Ensure");
+    auto PyRelease = (PyGILState_Release_t)GetProcAddress(hPy, "PyGILState_Release");
+
+    if (!PyRun) {
+        err = "PyRun_SimpleString not found in Python DLL.";
+        return false;
+    }
+
+    int gstate = PyEnsure ? PyEnsure() : 0;
+    int res = PyRun(pyCode.c_str());
+    if (PyRelease) PyRelease(gstate);
+
+    if (res != 0) {
+        err = "Python execution error (code " + std::to_string(res) + ")";
+        return false;
+    }
+    return true;
+}
+
+static std::string evaluateNukePath(const std::string& raw) {
+    if (raw.empty()) return "";
+    if (raw.find('[') == std::string::npos) return raw;
 
     std::string clean;
     for (char c : raw) {
@@ -142,53 +220,164 @@ static std::string evaluateNukePath(const std::string& raw) {
         "except Exception as e:\n"
         "    import os\n"
         "    os.environ['_GENTOOLS_EVAL_PATH'] = os.environ.get('TEMP', 'C:/Temp') + '/GenTools'\n";
-    PyRun(py.c_str());
 
-    char buf[4096];
-    DWORD len = GetEnvironmentVariableA("_GENTOOLS_EVAL_PATH", buf, sizeof(buf));
-    if (len > 0 && len < sizeof(buf)) {
-        return std::string(buf);
+    std::string err;
+    if (runPythonScript(py, err)) {
+        char buf[4096];
+        DWORD len = GetEnvironmentVariableA("_GENTOOLS_EVAL_PATH", buf, sizeof(buf));
+        if (len > 0 && len < sizeof(buf)) {
+            return std::string(buf);
+        }
     }
     return raw;
 }
 
-static void spitReadNode(const std::string& seqPath, int firstFrame, int lastFrame, const std::string& nodeLabel, const std::string& colorspace) {
-    HMODULE hPy = GetModuleHandleA("python310.dll");
-    if (!hPy) hPy = GetModuleHandleA("python311.dll");
-    if (!hPy) hPy = GetModuleHandleA("python39.dll");
-    if (!hPy) hPy = GetModuleHandleA("python3.dll");
-    if (!hPy) return;
+static void autoDerivePathInNuke(Instance* inst) {
+    std::string nName = inst->nodeName;
+    std::string isCleanStr = inst->isCleanGen ? "True" : "False";
 
-    typedef int (*PyRun_SimpleString_t)(const char*);
-    auto PyRun = (PyRun_SimpleString_t)GetProcAddress(hPy, "PyRun_SimpleString");
-    if (!PyRun) return;
+    std::string py =
+        "def _gentools_derive():\n"
+        "    try:\n"
+        "        import nuke, os, re\n"
+        "        node = nuke.toNode('" + nName + "')\n"
+        "        if not node:\n"
+        "            cands = [n for n in nuke.allNodes() if 'Alpha_Gen' in n.Class() or 'Clean_Gen' in n.Class() or 'AlphaGenSAM' in n.Class()]\n"
+        "            if cands: node = cands[-1]\n"
+        "        if not node: return\n"
+        "        curr = node.input(0)\n"
+        "        visited = set()\n"
+        "        read_node = None\n"
+        "        while curr and curr not in visited:\n"
+        "            visited.add(curr)\n"
+        "            if curr.Class() == 'Read':\n"
+        "                read_node = curr\n"
+        "                break\n"
+        "            if curr.inputs() > 0:\n"
+        "                curr = curr.input(0)\n"
+        "            else:\n"
+        "                break\n"
+        "        if read_node:\n"
+        "            raw_file = read_node['file'].value()\n"
+        "        else:\n"
+        "            _root = nuke.root().name()\n"
+        "            _sdir = os.path.dirname(_root) if (_root and _root != 'Root') else os.environ.get('TEMP', 'C:/Temp')\n"
+        "            raw_file = _sdir.replace('\\\\', '/') + '/renders/shot.####.exr'\n"
+        "        clean_path = raw_file.replace('\\\\', '/')\n"
+        "        dirname, filename = os.path.split(clean_path)\n"
+        "        m = re.match(r'^(.*?)(\\.(?:#+|%\\d+d|\\d+))?(\\.[a-zA-Z0-9]+)$', filename)\n"
+        "        if m:\n"
+        "            base_name = m.group(1)\n"
+        "            pad = m.group(2) if m.group(2) else '.####'\n"
+        "            ext = m.group(3) if m.group(3) else '.exr'\n"
+        "        else:\n"
+        "            base_name = filename\n"
+        "            pad = '.####'\n"
+        "            ext = '.exr'\n"
+        "        is_clean = " + isCleanStr + "\n"
+        "        tag = '_Gen_clean' if is_clean else '_Gen_matte'\n"
+        "        sub_folder = 'Cleanplate' if is_clean else 'AlphaGen'\n"
+        "        v_match = re.search(r'(_v\\d+.*)$', base_name, re.IGNORECASE)\n"
+        "        if v_match:\n"
+        "            idx = v_match.start(1)\n"
+        "            new_base = base_name[:idx] + tag + base_name[idx:]\n"
+        "        else:\n"
+        "            new_base = base_name + tag\n"
+        "        dir_lower = dirname.lower()\n"
+        "        shot_root = None\n"
+        "        for token in ['/plates/', '/plate/', '/source/', '/elements/', '/src/']:\n"
+        "            pos = dir_lower.rfind(token)\n"
+        "            if pos != -1:\n"
+        "                shot_root = dirname[:pos]\n"
+        "                break\n"
+        "        if not shot_root:\n"
+        "            parent_dir = os.path.dirname(dirname)\n"
+        "            shot_root = parent_dir if parent_dir else dirname\n"
+        "        out_file = f'{shot_root}/GenAi/{sub_folder}/{new_base}{pad}{ext}'\n"
+        "        try:\n"
+        "            node['outputPath'].setValue(out_file)\n"
+        "        except Exception as e:\n"
+        "            pass\n"
+        "    except Exception as e:\n"
+        "        print('[GenTools] auto-derive error:', e)\n"
+        "import nuke\n"
+        "nuke.executeInMainThread(_gentools_derive)\n";
 
-    std::string clean = seqPath;
+    std::string err;
+    runPythonScript(py, err);
+}
+
+static void spitReadNode(const std::string& nodeName, const std::string& outputPath, int firstFrame, int lastFrame, bool isClean) {
+    std::string clean = outputPath;
     for (char& c : clean) {
         if (c == '\\') c = '/';
     }
 
+    std::string isCleanStr = isClean ? "True" : "False";
     std::string py =
-        "try:\n"
-        "    import nuke\n"
-        "    for n in nuke.selectedNodes(): n.setSelected(False)\n"
-        "    r = nuke.createNode('Read', inpanel=False)\n"
-        "    r['file'].fromUserText('" + clean + "')\n"
-        "    r['first'].setValue(" + std::to_string(firstFrame) + ")\n"
-        "    r['last'].setValue(" + std::to_string(lastFrame) + ")\n"
-        "    r['origfirst'].setValue(" + std::to_string(firstFrame) + ")\n"
-        "    r['origlast'].setValue(" + std::to_string(lastFrame) + ")\n";
-    if (!colorspace.empty()) {
-        py += "    try:\n        r['colorspace'].setValue('" + colorspace + "')\n    except: pass\n";
-    }
-    py +=
-        "    r['label'].setValue('" + nodeLabel + "\\n[value first]-[value last]')\n"
-        "    r.setSelected(True)\n"
-        "    print('[Gen Tools] Created Read node:', r.name(), '" + clean + "')\n"
-        "except Exception as e:\n"
-        "    print('[Gen Tools] Error creating Read node:', e)\n";
+        "def _gentools_spit_read():\n"
+        "    try:\n"
+        "        import nuke, os, re\n"
+        "        node = nuke.toNode('" + nodeName + "')\n"
+        "        if not node:\n"
+        "            cands = [n for n in nuke.allNodes() if 'Alpha_Gen' in n.Class() or 'Clean_Gen' in n.Class() or 'AlphaGenSAM' in n.Class()]\n"
+        "            if cands: node = cands[-1]\n"
+        "        if not node: return\n"
+        "        out_pattern = '" + clean + "'.replace('\\\\', '/')\n"
+        "        out_dir = os.path.dirname(out_pattern)\n"
+        "        if out_dir and not os.path.exists(out_dir):\n"
+        "            os.makedirs(out_dir, exist_ok=True)\n"
+        "        first_f = " + std::to_string(firstFrame) + "\n"
+        "        last_f = " + std::to_string(lastFrame) + "\n"
+        "        is_clean = " + isCleanStr + "\n"
+        "        ext = os.path.splitext(out_pattern)[1].lower()\n"
+        "        test_file = out_pattern\n"
+        "        if '####' in test_file: test_file = test_file.replace('####', f'{int(first_f):04d}')\n"
+        "        elif '%04d' in test_file: test_file = test_file.replace('%04d', f'{int(first_f):04d}')\n"
+        "        elif '%d' in test_file: test_file = test_file.replace('%d', f'{int(first_f)}')\n"
+        "        if not os.path.exists(test_file):\n"
+        "            w = nuke.nodes.Write()\n"
+        "            w.setInput(0, node)\n"
+        "            w['file'].fromUserText(out_pattern)\n"
+        "            if ext == '.exr':\n"
+        "                try:\n"
+        "                    w['file_type'].setValue('exr')\n"
+        "                    w['datatype'].setValue('16 bit half')\n"
+        "                    w['compression'].setValue('Zip (1 scanline)')\n"
+        "                except Exception: pass\n"
+        "            elif ext == '.png':\n"
+        "                try:\n"
+        "                    w['file_type'].setValue('png')\n"
+        "                    w['datatype'].setValue('8 bit' if is_clean else '16 bit')\n"
+        "                except Exception: pass\n"
+        "            try:\n"
+        "                nuke.execute(w, int(first_f), int(last_f))\n"
+        "            except Exception as e:\n"
+        "                print('[GenTools] Write execution notice:', e)\n"
+        "            finally:\n"
+        "                nuke.delete(w)\n"
+        "        for n in nuke.selectedNodes(): n.setSelected(False)\n"
+        "        r = nuke.createNode('Read', inpanel=False)\n"
+        "        r['file'].fromUserText(out_pattern)\n"
+        "        r['first'].setValue(int(first_f))\n"
+        "        r['last'].setValue(int(last_f))\n"
+        "        r['origfirst'].setValue(int(first_f))\n"
+        "        r['origlast'].setValue(int(last_f))\n"
+        "        if ext == '.png':\n"
+        "            try: r['colorspace'].setValue('sRGB' if is_clean else 'linear')\n"
+        "            except Exception: pass\n"
+        "        r.setXYpos(node.xpos() + 200, node.ypos())\n"
+        "        lbl = ('Clean_Gen_Plate' if is_clean else 'Alpha_Gen_Matte') + '\\n[value first]-[value last]'\n"
+        "        r['label'].setValue(lbl)\n"
+        "        r.setSelected(True)\n"
+        "        print('[Gen Tools] Created Read node:', r.name(), '->', out_pattern)\n"
+        "    except Exception as e:\n"
+        "        print('[Gen Tools] Error creating Read node:', e)\n"
+        "import nuke\n"
+        "nuke.executeInMainThread(_gentools_spit_read)\n";
 
-    PyRun(py.c_str());
+    std::string err;
+    runPythonScript(py, err);
 }
 
 static std::string strf(const char* fmt, ...) {
@@ -647,15 +836,20 @@ static OfxStatus describeInContextCommon(OfxImageEffectHandle effect, bool isCle
                kOfxParamTypePushButton);
     defString(ps, "status", "status", nullptr, nullptr, "", kOfxParamStringIsSingleLine, true);
 
-    defString(ps, "exportDir", "export sequence folder",
-              "Where rendered frame sequences are written on disk.\n"
-              "Defaults to: [file dirname [value root.name]]/renders/...",
-              nullptr, isCleanGen ? "[file dirname [value root.name]]/renders/Clean_Gen" : "[file dirname [value root.name]]/renders/Alpha_Gen",
-              kOfxParamStringIsFilePath);
+    defString(ps, "outputPath", "output file",
+              "Target file sequence path on disk (supports #### or %04d, .exr or .png).\n"
+              "Auto-derived from upstream Read plate if empty.\n"
+              "Example: G:/.../GenAi/Cleanplate/..._Gen_clean_v001.####.exr",
+              nullptr, "", kOfxParamStringIsFilePath);
+    defButton(ps, "detectPath", "Detect Path from Plate",
+              "Inspect upstream Read node file path and auto-derive VFX standard GenAi output sequence path",
+              nullptr);
     defBool(ps, "autoRead", "auto create Read node",
-            "Automatically create and link a Nuke Read node when processing finishes", nullptr, true);
-    defDivider(ps, "spitRead", "Spit Read Node", "Create or update a Nuke Read node pointing to the exported sequence on disk",
+            "Automatically export and create a Nuke Read node when processing finishes", nullptr, true);
+    defDivider(ps, "spitRead", "Spit Read Node",
+               "Export / link a Nuke Read node pointing to the output sequence on disk",
                kOfxParamTypePushButton);
+    defString(ps, "exportDir", "export sequence folder", nullptr, nullptr, "", kOfxParamStringIsFilePath, true);
 
     // ---- advanced
     defGroup(ps, "advancedGroup", "Advanced", false);
@@ -703,7 +897,7 @@ static OfxStatus describeInContextCommon(OfxImageEffectHandle effect, bool isCle
               "Where the models run.\nComfy Cloud: cloud GPUs through your Comfy Cloud subscription and an API key "
               "from the Comfy platform; no GPU needed on this machine.\nComfy Local: your own ComfyUI (server "
               "address below) with the models downloaded; needs a big GPU.",
-              "serverGroup", {"Comfy Local", "Comfy Cloud"}, kBackendCloud);
+              "serverGroup", {"Comfy Local", "Comfy Cloud"}, kBackendLocal);
     defString(ps, "cloudKey", "API key", "Comfy Cloud API key status. The key itself is kept in "
               "Documents\\DUGco\\comfy_cloud_api_key.txt, never in the Nuke script, so scripts are safe to share.",
               "serverGroup", "", kOfxParamStringIsSingleLine);
@@ -712,7 +906,7 @@ static OfxStatus describeInContextCommon(OfxImageEffectHandle effect, bool isCle
     defButton(ps, "getKey", "Get an API Key", "Opens the Comfy platform in your browser: sign in with your Comfy "
               "Cloud account and create a key", "serverGroup");
     defString(ps, "serverUrl", "local server", "Comfy Local only: the ComfyUI address (this machine or another on the "
-              "network).", "serverGroup", "http://127.0.0.1:8000");
+              "network).", "serverGroup", "http://127.0.0.1:8188");
     defButton(ps, "testServer", "Test Connection", nullptr, "serverGroup");
     defString(ps, "samModel", "SAM 3.1 checkpoint", nullptr, "serverGroup", "sam3.1_multiplex_fp16.safetensors");
     defString(ps, "unetModel", "LTX transformer", nullptr, "serverGroup",
@@ -804,9 +998,19 @@ static OfxStatus createInstance(OfxImageEffectHandle effect) {
     inst->anaStart = ph(ps, "anaStart");
     inst->anaCount = ph(ps, "anaCount");
     inst->cacheVersion = ph(ps, "cacheVersion");
+    inst->outputPath = ph(ps, "outputPath");
+    inst->detectPath = ph(ps, "detectPath");
     inst->exportDir = ph(ps, "exportDir");
     inst->autoRead = ph(ps, "autoRead");
     inst->spitRead = ph(ps, "spitRead");
+
+    GenToolsSettings cfg = loadSettings();
+    gParam->paramSetValue(inst->backend, cfg.backend);
+    if (getString(inst->serverUrl).empty() || getString(inst->serverUrl) == "http://127.0.0.1:8000") {
+        gParam->paramSetValue(inst->serverUrl, cfg.serverUrl.c_str());
+    }
+    gParam->paramSetValue(inst->autoRead, cfg.autoRead);
+
     if (getString(inst->session).empty()) gParam->paramSetValue(inst->session, newSessionId().c_str());
     updateRangeEnabled(inst);
     // Load SAM 3.1 in ComfyUI now, so the first click previews quickly (once per server per Nuke session).
@@ -823,7 +1027,15 @@ static OfxStatus createInstance(OfxImageEffectHandle effect) {
 
     OfxPropertySetHandle props;
     gEffect->getPropertySet(effect, &props);
+    char* nName = nullptr;
+    if (gProp->propGetString(props, kOfxPropName, 0, &nName) == kOfxStatOK && nName) {
+        inst->nodeName = nName;
+    }
     gProp->propSetPointer(props, kOfxPropInstanceData, 0, inst);
+
+    if (getString(inst->outputPath).empty()) {
+        autoDerivePathInNuke(inst);
+    }
     return kOfxStatOK;
 }
 
@@ -985,8 +1197,14 @@ static std::string buildJob(Instance* inst, double now, engine::Job& j, int& fir
         j.mode = engine::kClean;
         j.cleanPlateOnly = true;
     }
-    std::string exp = evaluateNukePath(getString(inst->exportDir));
-    j.exportDir = exp.empty() ? fs::path() : fs::path(exp);
+    std::string outPat = evaluateNukePath(getString(inst->outputPath));
+    std::string exp = outPat.empty() ? evaluateNukePath(getString(inst->exportDir)) : outPat;
+    fs::path expPath(exp);
+    if (!exp.empty() && expPath.has_extension()) {
+        j.exportDir = expPath.parent_path();
+    } else {
+        j.exportDir = exp.empty() ? fs::path() : expPath;
+    }
     j.chunk = std::clamp(getInt(inst->chunk), 9, 145);
     j.blend = std::clamp(getInt(inst->blend), 0, 48);
     j.seed = getInt(inst->seed);
@@ -1164,9 +1382,21 @@ static void doProcess(OfxImageEffectHandle effect, Instance* inst, double now) {
     gParam->paramSetValue(inst->show, inst->isCleanGen ? 0 : (int)kShowMatte);
 
     // Export sequences to disk
-    std::string exp = evaluateNukePath(getString(inst->exportDir));
-    fs::path expDir = exp.empty() ? fs::path() : fs::path(exp);
-    if (!expDir.empty()) {
+    std::string outPattern = getString(inst->outputPath);
+    if (outPattern.empty()) {
+        autoDerivePathInNuke(inst);
+        outPattern = getString(inst->outputPath);
+    }
+    if (outPattern.empty()) {
+        std::string exp = evaluateNukePath(getString(inst->exportDir));
+        if (!exp.empty()) {
+            outPattern = (fs::path(exp) / (inst->isCleanGen ? "clean_plate_%04d.png" : "matte_%04d.png")).string();
+        }
+    }
+
+    if (!outPattern.empty()) {
+        fs::path p(outPattern);
+        fs::path expDir = p.has_extension() ? p.parent_path() : p;
         std::error_code ec;
         fs::create_directories(expDir, ec);
         if (!inst->isCleanGen) {
@@ -1181,9 +1411,8 @@ static void doProcess(OfxImageEffectHandle effect, Instance* inst, double now) {
         }
     }
 
-    if (getInt(inst->autoRead) && !expDir.empty()) {
-        std::string pattern = (expDir / (inst->isCleanGen ? "clean_plate_%04d.png" : "matte_%04d.png")).string();
-        spitReadNode(pattern, first, first + j.count - 1, inst->isCleanGen ? "Clean_Gen_Plate" : "Alpha_Gen_Matte", inst->isCleanGen ? "sRGB" : "linear");
+    if (getInt(inst->autoRead) && !outPattern.empty()) {
+        spitReadNode(inst->nodeName, outPattern, first, first + j.count - 1, inst->isCleanGen);
     }
 
     int secs = (int)((GetTickCount() - t0) / 1000);
@@ -1219,10 +1448,23 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
         startPreview(effect, inst, now, false);
     } else if (n == "process") {
         doProcess(effect, inst, now);
+    } else if (n == "detectPath") {
+        autoDerivePathInNuke(inst);
+        return kOfxStatOK;
     } else if (n == "spitRead") {
-        std::string exp = evaluateNukePath(getString(inst->exportDir));
-        if (exp.empty()) {
-            message(effect, kOfxMessageError, "Export sequence folder is empty.");
+        std::string outPattern = getString(inst->outputPath);
+        if (outPattern.empty()) {
+            autoDerivePathInNuke(inst);
+            outPattern = getString(inst->outputPath);
+        }
+        if (outPattern.empty()) {
+            std::string exp = evaluateNukePath(getString(inst->exportDir));
+            if (!exp.empty()) {
+                outPattern = (fs::path(exp) / (inst->isCleanGen ? "clean_plate_%04d.png" : "matte_%04d.png")).string();
+            }
+        }
+        if (outPattern.empty()) {
+            message(effect, kOfxMessageError, "Output sequence path is empty. Click 'Detect Path from Plate' or enter a valid file pattern.");
             return kOfxStatOK;
         }
         int a = 0, b = 0;
@@ -1233,8 +1475,7 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
             inputRange(inst, a, b);
         }
         if (b < a) std::swap(a, b);
-        std::string pattern = (fs::path(exp) / (inst->isCleanGen ? "clean_plate_%04d.png" : "matte_%04d.png")).string();
-        spitReadNode(pattern, a, b, inst->isCleanGen ? "Clean_Gen_Plate" : "Alpha_Gen_Matte", inst->isCleanGen ? "sRGB" : "linear");
+        spitReadNode(inst->nodeName, outPattern, a, b, inst->isCleanGen);
         return kOfxStatOK;
     } else if (n == "clearPoints") {
         gParam->paramSetValue(inst->points, "");
@@ -1249,10 +1490,15 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
     } else if (n == "testServer") {
         comfy::Server s;
         std::string err = backendServer(inst, s), info;
-        if (err.empty() && comfy::ping(s, info, err))
+        if (err.empty() && comfy::ping(s, info, err)) {
+            GenToolsSettings cfg = loadSettings();
+            cfg.backend = getInt(inst->backend);
+            cfg.serverUrl = getString(inst->serverUrl);
+            saveSettings(cfg);
             message(effect, kOfxMessageMessage, "Connected to ComfyUI " + info + " at " + s.label());
-        else
+        } else {
             message(effect, kOfxMessageError, err);
+        }
     } else if (n == "setKey") {
         std::string key, err;
         if (askApiKey(key)) {
@@ -1271,8 +1517,13 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
         }
     } else if (n == "getKey") {
         ShellExecuteW(nullptr, L"open", L"https://platform.comfy.org/login", nullptr, nullptr, SW_SHOWNORMAL);
-    } else if (n == "backend") {
-        if (getInt(inst->backend) == kBackendCloud) {  // say straight away if the key is missing
+    } else if (n == "backend" || n == "serverUrl" || n == "autoRead") {
+        GenToolsSettings cfg = loadSettings();
+        cfg.backend = getInt(inst->backend);
+        cfg.serverUrl = getString(inst->serverUrl);
+        cfg.autoRead = getInt(inst->autoRead);
+        saveSettings(cfg);
+        if (n == "backend" && cfg.backend == kBackendCloud) {  // say straight away if the key is missing
             comfy::Server cs;
             std::string err;
             cs = comfy::Server::cloudServer(err);
