@@ -2057,11 +2057,10 @@ static OfxPlugin gPluginClean = {kOfxImageEffectPluginApi, 1, PLUGIN_ID_CLEAN, 1
 static OfxPlugin gPluginLegacy = {kOfxImageEffectPluginApi, 1, PLUGIN_ID_LEGACY, 1, 0, setHost, mainEntryLegacy};
 
 extern "C" {
-__declspec(dllexport) int OfxGetNumberOfPlugins(void) { return 3; }
+__declspec(dllexport) int OfxGetNumberOfPlugins(void) { return 2; }
 __declspec(dllexport) OfxPlugin* OfxGetPlugin(int nth) {
     if (nth == 0) return &gPluginAlpha;
     if (nth == 1) return &gPluginClean;
-    if (nth == 2) return &gPluginLegacy;
     return nullptr;
 }
 }
