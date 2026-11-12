@@ -32,7 +32,7 @@ jobs:
       shell: cmd
       run: |
         mkdir dist 2>nul
-        powershell -Command "Compress-Archive -Path build\AlphaGenSAM.ofx.bundle, install.bat, uninstall.bat, icons, README.md, LICENSE -DestinationPath dist\GenTools_OFX_win64.zip -Force"
+        powershell -Command "Compress-Archive -Path build\GenTools.ofx.bundle, install.bat, uninstall.bat, icons, README.md, LICENSE -DestinationPath dist\GenTools_OFX_win64.zip -Force"
 
     - name: Upload Build Artifact
       uses: actions/upload-artifact@v4
@@ -47,3 +47,4 @@ jobs:
         files: dist/GenTools_OFX_win64.zip
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
