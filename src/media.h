@@ -23,6 +23,10 @@ bool init(std::string& err);  // COM + Media Foundation, once per process
 
 bool writePNG(const std::wstring& path, const Frame& f, std::string& err);
 bool writePNG(const std::wstring& path, const Gray& g, std::string& err);
+bool writeEXR(const std::wstring& path, const Frame& f, std::string& err);
+bool writeEXR(const std::wstring& path, const Gray& g, std::string& err);
+bool writeImage(const std::wstring& path, const Frame& f, std::string& err);
+bool writeImage(const std::wstring& path, const Gray& g, std::string& err);
 
 // Decode a PNG (8 or 16 bit, grey/RGB/RGBA) from memory; returns the red channel.
 bool decodePNG(const std::string& bytes, Gray& out, std::string& err);

@@ -76,6 +76,7 @@ struct Job {
     std::string session;  // per-node id; names uploads and output folders
     fs::path dir;         // local cache for this node (mattes as PFM)
     fs::path exportDir;   // user-configured output folder for sequences
+    std::string outputPattern; // user-configured full sequence pattern (e.g. ..._Gen_clean_v001.####.exr)
     bool cleanPlateOnly = false;
     Models models;
     int W = 0, H = 0;     // working resolution (multiples of 32)
@@ -92,6 +93,35 @@ struct Job {
     int blend = 16;       // frames of overlap cross-faded between chunks
     int seed = 42;
 };
+
+static inline fs::path formatFramePath(const std::string& pattern, int frame) {
+    if (pattern.empty()) return fs::path();
+    std::string s = pattern;
+    for (char& c : s) if (c == '\\') c = '/';
+    char numBuf[32];
+    snprintf(numBuf, sizeof(numBuf), "%04d", frame);
+    size_t hashPos = s.find("####");
+    if (hashPos != std::string::npos) {
+        s.replace(hashPos, 4, numBuf);
+        return fs::path(s);
+    }
+    size_t fmtPos = s.find("%04d");
+    if (fmtPos != std::string::npos) {
+        s.replace(fmtPos, 4, numBuf);
+        return fs::path(s);
+    }
+    snprintf(numBuf, sizeof(numBuf), "%d", frame);
+    size_t dPos = s.find("%d");
+    if (dPos != std::string::npos) {
+        s.replace(dPos, 2, numBuf);
+        return fs::path(s);
+    }
+    fs::path p(s);
+    if (!p.has_extension()) {
+        return p / ("clean_plate_" + std::string(numBuf) + ".png");
+    }
+    return p;
+}
 
 // Returns frame i (0..count-1) at working resolution, or nullptr on failure.
 using FrameSource = std::function<const Frame*(int)>;

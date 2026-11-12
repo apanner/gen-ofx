@@ -242,7 +242,7 @@ static void autoDerivePathInNuke(Instance* inst) {
         "        import nuke, os, re\n"
         "        node = nuke.toNode('" + nName + "')\n"
         "        if not node:\n"
-        "            cands = [n for n in nuke.allNodes() if 'Alpha_Gen' in n.Class() or 'Clean_Gen' in n.Class() or 'AlphaGenSAM' in n.Class()]\n"
+        "            cands = [n for n in nuke.allNodes() if 'Clean_Gen' in n.Class() or 'Alpha_Gen' in n.Class() or 'AlphaGenSAM' in n.Class()]\n"
         "            if cands: node = cands[-1]\n"
         "        if not node: return\n"
         "        curr = node.input(0)\n"
@@ -294,17 +294,27 @@ static void autoDerivePathInNuke(Instance* inst) {
         "            parent_dir = os.path.dirname(dirname)\n"
         "            shot_root = parent_dir if parent_dir else dirname\n"
         "        out_file = f'{shot_root}/GenAi/{sub_folder}/{new_base}{pad}{ext}'\n"
+        "        os.environ['_GENTOOLS_DERIVED_PATH'] = out_file\n"
         "        try:\n"
         "            node['outputPath'].setValue(out_file)\n"
-        "        except Exception as e:\n"
+        "        except Exception:\n"
         "            pass\n"
         "    except Exception as e:\n"
         "        print('[GenTools] auto-derive error:', e)\n"
-        "import nuke\n"
-        "nuke.executeInMainThread(_gentools_derive)\n";
+        "try:\n"
+        "    _gentools_derive()\n"
+        "except Exception:\n"
+        "    import nuke\n"
+        "    nuke.executeInMainThread(_gentools_derive)\n";
 
     std::string err;
     runPythonScript(py, err);
+
+    const char* derived = getenv("_GENTOOLS_DERIVED_PATH");
+    if (derived && *derived) {
+        gParam->paramSetValue(inst->outputPath, derived);
+        _putenv("_GENTOOLS_DERIVED_PATH=");
+    }
 }
 
 static void spitReadNode(const std::string& nodeName, const std::string& outputPath, int firstFrame, int lastFrame, bool isClean) {
@@ -320,7 +330,7 @@ static void spitReadNode(const std::string& nodeName, const std::string& outputP
         "        import nuke, os, re\n"
         "        node = nuke.toNode('" + nodeName + "')\n"
         "        if not node:\n"
-        "            cands = [n for n in nuke.allNodes() if 'Alpha_Gen' in n.Class() or 'Clean_Gen' in n.Class() or 'AlphaGenSAM' in n.Class()]\n"
+        "            cands = [n for n in nuke.allNodes() if 'Clean_Gen' in n.Class() or 'Alpha_Gen' in n.Class() or 'AlphaGenSAM' in n.Class()]\n"
         "            if cands: node = cands[-1]\n"
         "        if not node: return\n"
         "        out_pattern = '" + clean + "'.replace('\\\\', '/')\n"
@@ -331,31 +341,6 @@ static void spitReadNode(const std::string& nodeName, const std::string& outputP
         "        last_f = " + std::to_string(lastFrame) + "\n"
         "        is_clean = " + isCleanStr + "\n"
         "        ext = os.path.splitext(out_pattern)[1].lower()\n"
-        "        test_file = out_pattern\n"
-        "        if '####' in test_file: test_file = test_file.replace('####', f'{int(first_f):04d}')\n"
-        "        elif '%04d' in test_file: test_file = test_file.replace('%04d', f'{int(first_f):04d}')\n"
-        "        elif '%d' in test_file: test_file = test_file.replace('%d', f'{int(first_f)}')\n"
-        "        if not os.path.exists(test_file):\n"
-        "            w = nuke.nodes.Write()\n"
-        "            w.setInput(0, node)\n"
-        "            w['file'].fromUserText(out_pattern)\n"
-        "            if ext == '.exr':\n"
-        "                try:\n"
-        "                    w['file_type'].setValue('exr')\n"
-        "                    w['datatype'].setValue('16 bit half')\n"
-        "                    w['compression'].setValue('Zip (1 scanline)')\n"
-        "                except Exception: pass\n"
-        "            elif ext == '.png':\n"
-        "                try:\n"
-        "                    w['file_type'].setValue('png')\n"
-        "                    w['datatype'].setValue('8 bit' if is_clean else '16 bit')\n"
-        "                except Exception: pass\n"
-        "            try:\n"
-        "                nuke.execute(w, int(first_f), int(last_f))\n"
-        "            except Exception as e:\n"
-        "                print('[GenTools] Write execution notice:', e)\n"
-        "            finally:\n"
-        "                nuke.delete(w)\n"
         "        for n in nuke.selectedNodes(): n.setSelected(False)\n"
         "        r = nuke.createNode('Read', inpanel=False)\n"
         "        r['file'].fromUserText(out_pattern)\n"
@@ -373,8 +358,11 @@ static void spitReadNode(const std::string& nodeName, const std::string& outputP
         "        print('[Gen Tools] Created Read node:', r.name(), '->', out_pattern)\n"
         "    except Exception as e:\n"
         "        print('[Gen Tools] Error creating Read node:', e)\n"
-        "import nuke\n"
-        "nuke.executeInMainThread(_gentools_spit_read)\n";
+        "try:\n"
+        "    _gentools_spit_read()\n"
+        "except Exception:\n"
+        "    import nuke\n"
+        "    nuke.executeInMainThread(_gentools_spit_read)\n";
 
     std::string err;
     runPythonScript(py, err);
@@ -1006,7 +994,7 @@ static OfxStatus createInstance(OfxImageEffectHandle effect) {
 
     GenToolsSettings cfg = loadSettings();
     gParam->paramSetValue(inst->backend, cfg.backend);
-    if (getString(inst->serverUrl).empty() || getString(inst->serverUrl) == "http://127.0.0.1:8000") {
+    if (!cfg.serverUrl.empty()) {
         gParam->paramSetValue(inst->serverUrl, cfg.serverUrl.c_str());
     }
     gParam->paramSetValue(inst->autoRead, cfg.autoRead);
@@ -1198,6 +1186,7 @@ static std::string buildJob(Instance* inst, double now, engine::Job& j, int& fir
         j.cleanPlateOnly = true;
     }
     std::string outPat = evaluateNukePath(getString(inst->outputPath));
+    j.outputPattern = outPat;
     std::string exp = outPat.empty() ? evaluateNukePath(getString(inst->exportDir)) : outPat;
     fs::path expPath(exp);
     if (!exp.empty() && expPath.has_extension()) {
@@ -1346,7 +1335,7 @@ static void startPreview(OfxImageEffectHandle effect, Instance* inst, double now
         job->done = true;
     }).detach();
     if (gMessage2) gMessage2->clearPersistentMessage(effect);
-    gParam->paramSetValue(inst->show, (int)kShowPreview);
+    gParam->paramSetValue(inst->show, inst->isCleanGen ? 1 : (int)kShowPreview);
     setStatus(inst, strf("previewing frame %d", first + j.ref));
     bumpCache(inst);  // the viewer re-renders and waits for the job
 }
@@ -1404,8 +1393,9 @@ static void doProcess(OfxImageEffectHandle effect, Instance* inst, double now) {
                 std::shared_ptr<Gray> m = matteFor(inst, first + i);
                 if (m) {
                     std::string errPng;
-                    fs::path outP = expDir / strf("matte_%04d.png", first + i);
-                    media::writePNG(outP.wstring(), *m, errPng);
+                    fs::path outP = engine::formatFramePath(outPattern, first + i);
+                    fs::create_directories(outP.parent_path(), ec);
+                    media::writeImage(outP.wstring(), *m, errPng);
                 }
             }
         }
@@ -1452,10 +1442,10 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
         autoDerivePathInNuke(inst);
         return kOfxStatOK;
     } else if (n == "spitRead") {
-        std::string outPattern = getString(inst->outputPath);
+        std::string outPattern = evaluateNukePath(getString(inst->outputPath));
         if (outPattern.empty()) {
             autoDerivePathInNuke(inst);
-            outPattern = getString(inst->outputPath);
+            outPattern = evaluateNukePath(getString(inst->outputPath));
         }
         if (outPattern.empty()) {
             std::string exp = evaluateNukePath(getString(inst->exportDir));
@@ -1777,6 +1767,9 @@ static int previewCount(const fs::path& dir) {
 }
 
 static int matteSource(Instance* inst, double time) {
+    if (inst->isCleanGen) {
+        return getInt(inst->show, time) == 1 ? kOutPreview : kOutFinal;
+    }
     if (getInt(inst->show, time) == kShowPreview) return kOutPreview;
     switch (getInt(inst->debug, time)) {
         case kDebugSelection: return kOutSelection;

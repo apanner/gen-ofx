@@ -142,12 +142,16 @@
         }
         if (j.cleanPlateOnly) {
             std::error_code ec;
-            if (!j.exportDir.empty()) fs::create_directories(j.exportDir, ec);
             for (int k = 0; k < n; ++k) {
                 std::string e2;
-                if (!j.exportDir.empty()) {
+                if (!j.outputPattern.empty()) {
+                    fs::path outP = formatFramePath(j.outputPattern, j.firstFrame + s + k);
+                    fs::create_directories(outP.parent_path(), ec);
+                    media::writeImage(outP.wstring(), plateF[k], e2);
+                } else if (!j.exportDir.empty()) {
+                    fs::create_directories(j.exportDir, ec);
                     fs::path outP = j.exportDir / strf("clean_plate_%04d.png", j.firstFrame + s + k);
-                    media::writePNG(outP.wstring(), plateF[k], e2);
+                    media::writeImage(outP.wstring(), plateF[k], e2);
                 }
                 fs::path cacheP = j.dir / strf("clean_%06d.png", s + k);
                 media::writePNG(cacheP.wstring(), plateF[k], e2);

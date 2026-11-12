@@ -251,4 +251,196 @@ bool writeMP4(const std::wstring& path, const std::vector<const Frame*>& frames,
     return true;
 }
 
+// ------------------------------------------------------------- OpenEXR Writer (Native 16-bit Half)
+
+static inline uint16_t floatToHalf(float f) {
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000;
+    int32_t exp = ((x >> 23) & 0xff) - 127 + 15;
+    uint32_t mant = (x & 0x7fffff) >> 13;
+    if (exp <= 0) return (uint16_t)sign;
+    if (exp >= 31) return (uint16_t)(sign | 0x7c00);
+    return (uint16_t)(sign | (exp << 10) | mant);
+}
+
+static void addExrAttr(std::vector<uint8_t>& hdr, const char* name, const char* type, const void* data, uint32_t size) {
+    while (*name) hdr.push_back((uint8_t)*name++);
+    hdr.push_back(0);
+    while (*type) hdr.push_back((uint8_t)*type++);
+    hdr.push_back(0);
+    const uint8_t* sz = (const uint8_t*)&size;
+    hdr.insert(hdr.end(), sz, sz + 4);
+    const uint8_t* d = (const uint8_t*)data;
+    hdr.insert(hdr.end(), d, d + size);
+}
+
+bool writeEXR(const std::wstring& path, const Frame& fr, std::string& err) {
+    if (fr.w <= 0 || fr.h <= 0 || fr.rgb.empty()) {
+        err = "Invalid frame dimensions for EXR";
+        return false;
+    }
+    int w = fr.w, h = fr.h;
+    std::vector<uint8_t> hdr;
+    uint32_t magic = 0x01312f76, ver = 2;
+    const uint8_t* m = (const uint8_t*)&magic; hdr.insert(hdr.end(), m, m + 4);
+    const uint8_t* v = (const uint8_t*)&ver; hdr.insert(hdr.end(), v, v + 4);
+
+    std::vector<uint8_t> chList;
+    for (const char* ch : {"B", "G", "R"}) {
+        while (*ch) chList.push_back((uint8_t)*ch++);
+        chList.push_back(0);
+        int32_t ptype = 1; // 1 = HALF
+        const uint8_t* pt = (const uint8_t*)&ptype; chList.insert(chList.end(), pt, pt + 4);
+        chList.push_back(0); chList.push_back(0); chList.push_back(0); chList.push_back(0);
+        int32_t xSamp = 1, ySamp = 1;
+        const uint8_t* xs = (const uint8_t*)&xSamp; chList.insert(chList.end(), xs, xs + 4);
+        const uint8_t* ys = (const uint8_t*)&ySamp; chList.insert(chList.end(), ys, ys + 4);
+    }
+    chList.push_back(0);
+    addExrAttr(hdr, "channels", "chlist", chList.data(), (uint32_t)chList.size());
+
+    int8_t comp = 0; // NO_COMPRESSION
+    addExrAttr(hdr, "compression", "compression", &comp, 1);
+
+    int32_t box[4] = {0, 0, w - 1, h - 1};
+    addExrAttr(hdr, "dataWindow", "box2i", box, 16);
+    addExrAttr(hdr, "displayWindow", "box2i", box, 16);
+
+    int8_t lineOrder = 0;
+    addExrAttr(hdr, "lineOrder", "lineOrder", &lineOrder, 1);
+
+    float par = 1.0f;
+    addExrAttr(hdr, "pixelAspectRatio", "float", &par, 4);
+
+    float center[2] = {0.0f, 0.0f};
+    addExrAttr(hdr, "screenWindowCenter", "v2f", center, 8);
+
+    float swidth = 1.0f;
+    addExrAttr(hdr, "screenWindowWidth", "float", &swidth, 4);
+
+    hdr.push_back(0);
+
+    uint64_t tablePos = hdr.size();
+    uint64_t lineDataStart = tablePos + (uint64_t)h * 8;
+    uint32_t rowDataSize = (uint32_t)w * 2 * 3;
+    uint64_t scanlineTotal = 4 + 4 + rowDataSize;
+
+    std::vector<uint64_t> offsets(h);
+    for (int y = 0; y < h; ++y) offsets[y] = lineDataStart + (uint64_t)y * scanlineTotal;
+
+    FILE* fp = _wfopen(path.c_str(), L"wb");
+    if (!fp) {
+        err = "Could not create EXR file";
+        return false;
+    }
+    fwrite(hdr.data(), 1, hdr.size(), fp);
+    fwrite(offsets.data(), 8, h, fp);
+
+    std::vector<uint16_t> rowB(w), rowG(w), rowR(w);
+    for (int y = 0; y < h; ++y) {
+        int32_t lineNum = y;
+        fwrite(&lineNum, 4, 1, fp);
+        fwrite(&rowDataSize, 4, 1, fp);
+        const uint8_t* srcRow = &fr.rgb[(size_t)y * w * 3];
+        for (int x = 0; x < w; ++x) {
+            float r = srcRow[x * 3 + 0] / 255.0f;
+            float g = srcRow[x * 3 + 1] / 255.0f;
+            float b = srcRow[x * 3 + 2] / 255.0f;
+            rowR[x] = floatToHalf(r);
+            rowG[x] = floatToHalf(g);
+            rowB[x] = floatToHalf(b);
+        }
+        fwrite(rowB.data(), 2, w, fp);
+        fwrite(rowG.data(), 2, w, fp);
+        fwrite(rowR.data(), 2, w, fp);
+    }
+    fclose(fp);
+    return true;
+}
+
+bool writeEXR(const std::wstring& path, const Gray& g, std::string& err) {
+    if (g.w <= 0 || g.h <= 0 || g.px.empty()) {
+        err = "Invalid gray dimensions for EXR";
+        return false;
+    }
+    int w = g.w, h = g.h;
+    std::vector<uint8_t> hdr;
+    uint32_t magic = 0x01312f76, ver = 2;
+    const uint8_t* m = (const uint8_t*)&magic; hdr.insert(hdr.end(), m, m + 4);
+    const uint8_t* v = (const uint8_t*)&ver; hdr.insert(hdr.end(), v, v + 4);
+
+    std::vector<uint8_t> chList;
+    const char* ch = "A";
+    while (*ch) chList.push_back((uint8_t)*ch++);
+    chList.push_back(0);
+    int32_t ptype = 1; // HALF
+    const uint8_t* pt = (const uint8_t*)&ptype; chList.insert(chList.end(), pt, pt + 4);
+    chList.push_back(0); chList.push_back(0); chList.push_back(0); chList.push_back(0);
+    int32_t xSamp = 1, ySamp = 1;
+    const uint8_t* xs = (const uint8_t*)&xSamp; chList.insert(chList.end(), xs, xs + 4);
+    const uint8_t* ys = (const uint8_t*)&ySamp; chList.insert(chList.end(), ys, ys + 4);
+    chList.push_back(0);
+    addExrAttr(hdr, "channels", "chlist", chList.data(), (uint32_t)chList.size());
+
+    int8_t comp = 0;
+    addExrAttr(hdr, "compression", "compression", &comp, 1);
+    int32_t box[4] = {0, 0, w - 1, h - 1};
+    addExrAttr(hdr, "dataWindow", "box2i", box, 16);
+    addExrAttr(hdr, "displayWindow", "box2i", box, 16);
+    int8_t lineOrder = 0;
+    addExrAttr(hdr, "lineOrder", "lineOrder", &lineOrder, 1);
+    float par = 1.0f;
+    addExrAttr(hdr, "pixelAspectRatio", "float", &par, 4);
+    float center[2] = {0.0f, 0.0f};
+    addExrAttr(hdr, "screenWindowCenter", "v2f", center, 8);
+    float swidth = 1.0f;
+    addExrAttr(hdr, "screenWindowWidth", "float", &swidth, 4);
+    hdr.push_back(0);
+
+    uint64_t tablePos = hdr.size();
+    uint64_t lineDataStart = tablePos + (uint64_t)h * 8;
+    uint32_t rowDataSize = (uint32_t)w * 2;
+    uint64_t scanlineTotal = 4 + 4 + rowDataSize;
+
+    std::vector<uint64_t> offsets(h);
+    for (int y = 0; y < h; ++y) offsets[y] = lineDataStart + (uint64_t)y * scanlineTotal;
+
+    FILE* fp = _wfopen(path.c_str(), L"wb");
+    if (!fp) {
+        err = "Could not create EXR file";
+        return false;
+    }
+    fwrite(hdr.data(), 1, hdr.size(), fp);
+    fwrite(offsets.data(), 8, h, fp);
+
+    std::vector<uint16_t> rowA(w);
+    for (int y = 0; y < h; ++y) {
+        int32_t lineNum = y;
+        fwrite(&lineNum, 4, 1, fp);
+        fwrite(&rowDataSize, 4, 1, fp);
+        const float* srcRow = &g.px[(size_t)y * w];
+        for (int x = 0; x < w; ++x) {
+            rowA[x] = floatToHalf(srcRow[x]);
+        }
+        fwrite(rowA.data(), 2, w, fp);
+    }
+    fclose(fp);
+    return true;
+}
+
+bool writeImage(const std::wstring& path, const Frame& f, std::string& err) {
+    if (path.size() >= 4 && (_wcsicmp(path.c_str() + path.size() - 4, L".exr") == 0)) {
+        return writeEXR(path, f, err);
+    }
+    return writePNG(path, f, err);
+}
+
+bool writeImage(const std::wstring& path, const Gray& g, std::string& err) {
+    if (path.size() >= 4 && (_wcsicmp(path.c_str() + path.size() - 4, L".exr") == 0)) {
+        return writeEXR(path, g, err);
+    }
+    return writePNG(path, g, err);
+}
+
 }  // namespace media
