@@ -75,8 +75,18 @@
         const std::string kind = cleanKind(obj);
         c.base = base;
         c.span = span;
-        std::string label = strf("Clean plate + Alpha-Gen (%s), chunk %d/%d", j.objects[obj].label().c_str(), ci + 1, chunks);
+        std::string label = strf("Clean plate (%s), chunk %d/%d", j.objects[obj].label().c_str(), ci + 1, chunks);
         if (!c.step(0.0, label + ": building the hole")) return false;
+
+        if (plateRemote[ci].empty()) {
+            std::vector<const Frame*> ptrs;
+            for (int k = 0; k < n; ++k) ptrs.push_back(frames(s + k));
+            while ((int)ptrs.size() < length) ptrs.push_back(ptrs.back());
+            std::string name = strf("dugco_agsam_%s_plate_%03d.mp4", j.session.c_str(), ci);
+            if (!media::writeMP4(uploadPath(j, name), ptrs, 24, err)) return c.fail(err);
+            plateRemote[ci] = comfy::upload(j.server, uploadPath(j, name), name, err);
+            if (plateRemote[ci].empty()) return c.fail(err);
+        }
         std::vector<Frame> guideF(n), holeF(n), compF(n);
         for (int k = 0; k < n; ++k) {
             const Frame* f = frames(s + k);
@@ -122,7 +132,7 @@
         std::vector<std::pair<std::string, std::vector<comfy::OutputFile>>> outs;
         c.base = base + span * 0.04;
         c.span = span * 0.6;
-        if (!runGraph(c, cleanPlateGraph(j, plateRemote[ci], remote[0], remote[1], remote[2], length, ci, kind.c_str()),
+        if (!runGraph(c, cleanPlateGraph(j, plateRemote[ci], remote[0], remote[1], remote[2], length, ci, kind.c_str(), j.objects[obj].label()),
                       "clean", label + ": clean plate", outs))
             return false;
         c.base = base;

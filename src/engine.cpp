@@ -444,7 +444,7 @@ static std::string alphaGenGraph(const Job& j, const std::string& guideName, int
 //   comp: soft matte where the rebuilt pixels are used.
 static std::string cleanPlateGraph(const Job& j, const std::string& plate, const std::string& guide,
                                    const std::string& hole, const std::string& comp, int length, int chunkIndex,
-                                   const char* kind) {
+                                   const char* kind, const std::string& objectLabel = "") {
     Graph g;
     const int w1 = std::max(32, (j.W / 2) / 32 * 32), h1 = std::max(32, (j.H / 2) / 32 * 32);
     g.node(2, "LoadVideo", {{"file", Q(plate)}});
@@ -471,10 +471,14 @@ static std::string cleanPlateGraph(const Job& j, const std::string& plate, const
     g.node(34, "VAELoader", {{"vae_name", Q(j.models.audioVae)}});
     g.node(60, "LoraLoaderModelOnly", {{"model", L(30, 0)}, {"lora_name", Q(j.models.cleanLora)}, {"strength_model", F(1)}});
     g.node(61, "GetICLoRAParameters", {{"iclora_model", L(60, 0)}});
+    std::string promptText = "A clean plate of the exact same shot: ";
+    if (!objectLabel.empty()) {
+        promptText += "the scene with the " + objectLabel + " removed, ";
+    }
+    promptText += "the same place, the same light and colours, and the camera moving exactly as in the source video, with nobody and nothing extra in the frame. Natural, photorealistic, sharp.";
+
     g.node(62, "CLIPTextEncode", {{"clip", L(32, 0)},
-                                  {"text", Q("A clean plate of the exact same shot: the same place, the same light and "
-                                             "colours, and the camera moving exactly as in the source video, with nobody "
-                                             "and nothing extra in the frame. Natural, photorealistic, sharp.")}});
+                                  {"text", Q(promptText)}});
     g.node(63, "CLIPTextEncode", {{"clip", L(32, 0)},
                                   {"text", Q("person, people, figure, body part, hair, shadow of a person, ghosting, "
                                              "semi-transparent remnants, smudge, blurry, soft, flicker, jitter, worst "
@@ -682,7 +686,7 @@ std::string resolveModels(Job& j, bool needSam, bool needLtx, bool needClean, bo
     Need needs[] = {
         {needSam, "CheckpointLoaderSimple", "ckpt_name", "SAM 3.1 checkpoint", &j.models.sam},
         {needLtx, "UNETLoader", "unet_name", "LTX-2.5 transformer", &j.models.unet},
-        {needLtx, "LoraLoaderModelOnly", "lora_name", "LTX-2.5 Alpha-Gen IC-LoRA", &j.models.lora},
+        {needLtx && !j.cleanPlateOnly, "LoraLoaderModelOnly", "lora_name", "LTX-2.5 Alpha-Gen IC-LoRA", &j.models.lora},
         {needLtx, "CLIPLoader", "clip_name", "LTX-2.5 text encoder", &j.models.textEncoder},
         {needLtx, "VAELoader", "vae_name", "LTX-2.5 video VAE", &j.models.videoVae},
         {needLtx, "VAELoader", "vae_name", "LTX-2.5 audio VAE", &j.models.audioVae},
