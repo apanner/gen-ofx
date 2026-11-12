@@ -132,6 +132,20 @@
             std::string e2;
             media::writePNG((j.dir / strf("plate_%s_%06d.png", kind.c_str(), s + n / 2)).wstring(), plateF[n / 2], e2);
         }
+        if (j.cleanPlateOnly) {
+            std::error_code ec;
+            if (!j.exportDir.empty()) fs::create_directories(j.exportDir, ec);
+            for (int k = 0; k < n; ++k) {
+                std::string e2;
+                if (!j.exportDir.empty()) {
+                    fs::path outP = j.exportDir / strf("clean_plate_%04d.png", j.firstFrame + s + k);
+                    media::writePNG(outP.wstring(), plateF[k], e2);
+                }
+                fs::path cacheP = j.dir / strf("clean_%06d.png", s + k);
+                media::writePNG(cacheP.wstring(), plateF[k], e2);
+            }
+            return true;
+        }
         // job 2: Alpha-Gen on it
         std::vector<const Frame*> ptrs;
         for (auto& fr : plateF) ptrs.push_back(&fr);

@@ -42,11 +42,17 @@
 using engine::Gray;
 namespace fs = std::filesystem;
 
-// DUGco OFX tool pack: every tool lives under the "DUGco" menu with a com.dugco.* id
-// (the id stays lowercase: ids are case-sensitive and saved in Nuke scripts)
-#define PLUGIN_ID "com.dugco.AlphaGenSAM"
-#define PLUGIN_LABEL "AlphaGenSAM"
-#define PLUGIN_GROUPING "DUGco"
+// Gen Tools OFX Suite: Alpha_Gen and Clean_Gen
+#define PLUGIN_ID_ALPHA "com.apanner.alpha_gen"
+#define PLUGIN_LABEL_ALPHA "Alpha_Gen"
+
+#define PLUGIN_ID_CLEAN "com.apanner.clean_gen"
+#define PLUGIN_LABEL_CLEAN "Clean_Gen"
+
+#define PLUGIN_ID_LEGACY "com.dugco.AlphaGenSAM"
+#define PLUGIN_LABEL_LEGACY "AlphaGenSAM"
+
+#define PLUGIN_GROUPING "Gen Tools"
 
 static OfxHost* gHost = nullptr;
 static OfxPropertySuiteV1* gProp = nullptr;
@@ -84,11 +90,13 @@ static const float kTint[12][3] = {{0.2f, 1.f, 0.3f},  {1.f, 0.6f, 0.1f},  {0.2f
 
 
 struct Instance {
+    bool isCleanGen = false;
     OfxImageClipHandle src = nullptr, dst = nullptr;
     OfxParamHandle select, points, autoPreview, rangeMode, frameStart, frameEnd, show, debug, status;
     OfxParamHandle mode, workRes, chunk, blend, seed, colour, detThresh, others, reach, blackPt, whitePt;
     OfxParamHandle backend, cloudKey, serverUrl, samModel, unetModel, icLora, textEnc, videoVae, audioVae, cacheDir;
     OfxParamHandle session, anaStart, anaCount, cacheVersion;
+    OfxParamHandle exportDir, spitRead, autoRead;
 
     // viewer drag state (lives on the effect instance, shared by its overlay)
     int dragIndex = -1;
@@ -100,6 +108,88 @@ struct Instance {
 };
 
 // ----------------------------------------------------------------- helpers
+
+static std::string evaluateNukePath(const std::string& raw) {
+    if (raw.empty()) return "";
+    if (raw.find('[') == std::string::npos) return raw;
+    HMODULE hPy = GetModuleHandleA("python310.dll");
+    if (!hPy) hPy = GetModuleHandleA("python311.dll");
+    if (!hPy) hPy = GetModuleHandleA("python39.dll");
+    if (!hPy) hPy = GetModuleHandleA("python3.dll");
+    if (!hPy) return raw;
+
+    typedef int (*PyRun_SimpleString_t)(const char*);
+    auto PyRun = (PyRun_SimpleString_t)GetProcAddress(hPy, "PyRun_SimpleString");
+    if (!PyRun) return raw;
+
+    std::string clean;
+    for (char c : raw) {
+        if (c == '\\') clean += "\\\\";
+        else if (c == '\'') clean += "\\'";
+        else clean += c;
+    }
+
+    std::string py =
+        "try:\n"
+        "    import nuke, os\n"
+        "    _raw = '" + clean + "'\n"
+        "    _res = nuke.tcl('subst', _raw)\n"
+        "    if not _res or _res.startswith('['):\n"
+        "        _script = nuke.root().name()\n"
+        "        _dir = os.path.dirname(_script) if (_script and _script != 'Root') else os.environ.get('TEMP', 'C:/Temp')\n"
+        "        _res = _raw.replace('[file dirname [value root.name]]', _dir)\n"
+        "    os.environ['_GENTOOLS_EVAL_PATH'] = os.path.abspath(_res)\n"
+        "except Exception as e:\n"
+        "    import os\n"
+        "    os.environ['_GENTOOLS_EVAL_PATH'] = os.environ.get('TEMP', 'C:/Temp') + '/GenTools'\n";
+    PyRun(py.c_str());
+
+    char buf[4096];
+    DWORD len = GetEnvironmentVariableA("_GENTOOLS_EVAL_PATH", buf, sizeof(buf));
+    if (len > 0 && len < sizeof(buf)) {
+        return std::string(buf);
+    }
+    return raw;
+}
+
+static void spitReadNode(const std::string& seqPath, int firstFrame, int lastFrame, const std::string& nodeLabel, const std::string& colorspace) {
+    HMODULE hPy = GetModuleHandleA("python310.dll");
+    if (!hPy) hPy = GetModuleHandleA("python311.dll");
+    if (!hPy) hPy = GetModuleHandleA("python39.dll");
+    if (!hPy) hPy = GetModuleHandleA("python3.dll");
+    if (!hPy) return;
+
+    typedef int (*PyRun_SimpleString_t)(const char*);
+    auto PyRun = (PyRun_SimpleString_t)GetProcAddress(hPy, "PyRun_SimpleString");
+    if (!PyRun) return;
+
+    std::string clean = seqPath;
+    for (char& c : clean) {
+        if (c == '\\') c = '/';
+    }
+
+    std::string py =
+        "try:\n"
+        "    import nuke\n"
+        "    for n in nuke.selectedNodes(): n.setSelected(False)\n"
+        "    r = nuke.createNode('Read', inpanel=False)\n"
+        "    r['file'].fromUserText('" + clean + "')\n"
+        "    r['first'].setValue(" + std::to_string(firstFrame) + ")\n"
+        "    r['last'].setValue(" + std::to_string(lastFrame) + ")\n"
+        "    r['origfirst'].setValue(" + std::to_string(firstFrame) + ")\n"
+        "    r['origlast'].setValue(" + std::to_string(lastFrame) + ")\n";
+    if (!colorspace.empty()) {
+        py += "    try:\n        r['colorspace'].setValue('" + colorspace + "')\n    except: pass\n";
+    }
+    py +=
+        "    r['label'].setValue('" + nodeLabel + "\\n[value first]-[value last]')\n"
+        "    r.setSelected(True)\n"
+        "    print('[Gen Tools] Created Read node:', r.name(), '" + clean + "')\n"
+        "except Exception as e:\n"
+        "    print('[Gen Tools] Error creating Read node:', e)\n";
+
+    PyRun(py.c_str());
+}
 
 static std::string strf(const char* fmt, ...) {
     char buf[4096];
@@ -457,14 +547,12 @@ static void defDivider(OfxParamSetHandle ps, const char* name, const char* label
 static OfxStatus overlayMain(const char* action, const void* handle, OfxPropertySetHandle inArgs,
                              OfxPropertySetHandle outArgs);
 
-static OfxStatus describe(OfxImageEffectHandle effect) {
+static OfxStatus describePlugin(OfxImageEffectHandle effect, const char* label, const char* desc) {
     OfxPropertySetHandle props;
     gEffect->getPropertySet(effect, &props);
-    gProp->propSetString(props, kOfxPropLabel, 0, PLUGIN_LABEL);
+    gProp->propSetString(props, kOfxPropLabel, 0, label);
     gProp->propSetString(props, kOfxImageEffectPluginPropGrouping, 0, PLUGIN_GROUPING);
-    gProp->propSetString(props, kOfxPropPluginDescription, 0,
-                         "DUGco AlphaGenSAM: type or click the objects to matte; SAM 3.1 selects them and LTX-2.5 "
-                         "Alpha-Gen draws the matte, computed on a ComfyUI backend. Part of the DUGco OFX tool pack.");
+    gProp->propSetString(props, kOfxPropPluginDescription, 0, desc);
     gProp->propSetString(props, kOfxImageEffectPropSupportedContexts, 0, kOfxImageEffectContextFilter);
     gProp->propSetString(props, kOfxImageEffectPropSupportedContexts, 1, kOfxImageEffectContextGeneral);
     gProp->propSetString(props, kOfxImageEffectPropSupportedPixelDepths, 0, kOfxBitDepthFloat);
@@ -479,7 +567,24 @@ static OfxStatus describe(OfxImageEffectHandle effect) {
     return kOfxStatOK;
 }
 
-static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
+static OfxStatus describeAlpha(OfxImageEffectHandle effect) {
+    return describePlugin(effect, PLUGIN_LABEL_ALPHA,
+                          "Gen Tools Alpha_Gen: AI Rotoscoping and sub-pixel soft edge matting with multi-layer separation "
+                          "powered by SAM 3.1 and LTX-2.5 Alpha-Gen.");
+}
+
+static OfxStatus describeClean(OfxImageEffectHandle effect) {
+    return describePlugin(effect, PLUGIN_LABEL_CLEAN,
+                          "Gen Tools Clean_Gen: AI Clean Plate generation, wire/rig and object removal "
+                          "powered by SAM 3.1 and LTX-2.5 Clean-Plate IC-LoRA.");
+}
+
+static OfxStatus describeLegacy(OfxImageEffectHandle effect) {
+    return describePlugin(effect, PLUGIN_LABEL_LEGACY,
+                          "DUGco AlphaGenSAM (Legacy): AI matting powered by SAM 3.1 + LTX-2.5.");
+}
+
+static OfxStatus describeInContextCommon(OfxImageEffectHandle effect, bool isCleanGen) {
     OfxPropertySetHandle cp;
     gEffect->clipDefine(effect, kOfxImageEffectSimpleSourceClipName, &cp);
     gProp->propSetString(cp, kOfxImageEffectPropSupportedComponents, 0, kOfxImageComponentRGBA);
@@ -493,24 +598,38 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     OfxParamSetHandle ps;
     gEffect->getParamSet(effect, &ps);
 
-    // ---- main controls (no group: always visible). Short lines: Nuke doesn't wrap labels.
-    defChoice(ps, "show", "show",
-              "What the viewer shows. The alpha channel always carries the matte.\n"
-              "matte: white on black.\ncutout: the plate premultiplied by the matte.\n"
-              "plate + alpha: the untouched plate (for comping downstream).\n"
-              "selection preview: SAM 3.1's selection on the hero frame, one colour per object.",
-              nullptr, {"matte", "cutout (premultiplied)", "plate + alpha", "selection preview"}, kShowPreview);
-    defString(ps, "howto1", "", nullptr, nullptr, "1  What do you want a matte of?  Type it, or Ctrl+click it in the viewer",
-              kOfxParamStringIsLabel);
-    defString(ps, "howto2", "", nullptr, nullptr,
-              "    Ctrl+Shift+click = exclude     Alt+click = delete     (re-click on later frames if it gets lost)",
-              kOfxParamStringIsLabel);
-    defString(ps, "select", "select",
-              "What this node pulls the matte of: \"car\", \"person\", \"diner\" (every instance SAM 3.1 finds), "
-              "and/or Ctrl+click it in the viewer. One node = one matte: for another object, branch another "
-              "node off the same plate. Everything else in the shot is handled automatically (see Advanced > "
-              "also remove).",
-              nullptr, "");
+    if (isCleanGen) {
+        defChoice(ps, "show", "show",
+                  "What the viewer shows.\nclean plate: reconstructed clean background.\n"
+                  "selection preview: objects selected for removal.\noriginal plate: untouched input.",
+                  nullptr, {"clean plate", "selection preview", "original plate"}, 0);
+        defString(ps, "howto1", "", nullptr, nullptr, "1  What do you want to remove? Type it, or Ctrl+click it in viewer",
+                  kOfxParamStringIsLabel);
+        defString(ps, "howto2", "", nullptr, nullptr,
+                  "    Ctrl+Shift+click = exclude     Alt+click = delete     (re-click on later frames)",
+                  kOfxParamStringIsLabel);
+        defString(ps, "select", "remove",
+                  "What this node removes from the plate: \"person\", \"car\", \"wire\", \"tracking marker\".\n"
+                  "SAM 3.1 tracks and rebuilds the plate behind them using LTX Clean-Plate.",
+                  nullptr, "");
+    } else {
+        defChoice(ps, "show", "show",
+                  "What the viewer shows. The alpha channel always carries the matte.\n"
+                  "matte: white on black.\ncutout: the plate premultiplied by the matte.\n"
+                  "plate + alpha: the untouched plate (for comping downstream).\n"
+                  "selection preview: SAM 3.1's selection on the hero frame, one colour per object.",
+                  nullptr, {"matte", "cutout (premultiplied)", "plate + alpha", "selection preview"}, kShowPreview);
+        defString(ps, "howto1", "", nullptr, nullptr, "1  What do you want a matte of?  Type it, or Ctrl+click it in the viewer",
+                  kOfxParamStringIsLabel);
+        defString(ps, "howto2", "", nullptr, nullptr,
+                  "    Ctrl+Shift+click = exclude     Alt+click = delete     (re-click on later frames if it gets lost)",
+                  kOfxParamStringIsLabel);
+        defString(ps, "select", "select",
+                  "What this node pulls the matte of: \"dancer\", \"car\", \"person\".\n"
+                  "Multi-select supported (comma separated): each object tracks on its own.",
+                  nullptr, "");
+    }
+
     defString(ps, "points", "points", nullptr, nullptr, "", kOfxParamStringIsSingleLine, true);
     defDivider(ps, "clearPoints", "Clear Points", "Remove all clicked points", kOfxParamTypePushButton);
     defString(ps, "howto3", "", nullptr, nullptr, "2  Check the selection on this frame:", kOfxParamStringIsLabel);
@@ -518,15 +637,25 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
             "Refresh the selection preview (on this hero frame only) after every click or edit", nullptr, true);
     defDivider(ps, "preview", "Preview", "Show what SAM 3.1 selects on the current frame (coloured per object)",
                kOfxParamTypePushButton);
-    defString(ps, "howto4", "", nullptr, nullptr, "3  Pull the matte through the shot:", kOfxParamStringIsLabel);
+    defString(ps, "howto4", "", nullptr, nullptr, isCleanGen ? "3  Reconstruct clean plate through the shot:" : "3  Pull the matte through the shot:", kOfxParamStringIsLabel);
     defChoice(ps, "rangeMode", "frame range", nullptr, nullptr, {"input range", "custom"}, kRangeInput);
     defInt(ps, "frameStart", "first frame", "Used when frame range is custom", nullptr, 1, 0, 200);
     defInt(ps, "frameEnd", "last frame", "Used when frame range is custom", nullptr, 100, 0, 200);
     defDivider(ps, "process", "Process",
-               "Track the selection through the range and pull the matte with Alpha-Gen on the ComfyUI backend "
-               "(Nuke waits behind a progress bar; Cancel stops it).",
+               isCleanGen ? "Synthesize clean plate across the range on ComfyUI backend"
+                          : "Track selection through range and pull matte with Alpha-Gen on ComfyUI backend",
                kOfxParamTypePushButton);
     defString(ps, "status", "status", nullptr, nullptr, "", kOfxParamStringIsSingleLine, true);
+
+    defString(ps, "exportDir", "export sequence folder",
+              "Where rendered frame sequences are written on disk.\n"
+              "Defaults to: [file dirname [value root.name]]/renders/...",
+              nullptr, isCleanGen ? "[file dirname [value root.name]]/renders/Clean_Gen" : "[file dirname [value root.name]]/renders/Alpha_Gen",
+              kOfxParamStringIsFilePath);
+    defBool(ps, "autoRead", "auto create Read node",
+            "Automatically create and link a Nuke Read node when processing finishes", nullptr, true);
+    defDivider(ps, "spitRead", "Spit Read Node", "Create or update a Nuke Read node pointing to the exported sequence on disk",
+               kOfxParamTypePushButton);
 
     // ---- advanced
     defGroup(ps, "advancedGroup", "Advanced", false);
@@ -675,6 +804,9 @@ static OfxStatus createInstance(OfxImageEffectHandle effect) {
     inst->anaStart = ph(ps, "anaStart");
     inst->anaCount = ph(ps, "anaCount");
     inst->cacheVersion = ph(ps, "cacheVersion");
+    inst->exportDir = ph(ps, "exportDir");
+    inst->autoRead = ph(ps, "autoRead");
+    inst->spitRead = ph(ps, "spitRead");
     if (getString(inst->session).empty()) gParam->paramSetValue(inst->session, newSessionId().c_str());
     updateRangeEnabled(inst);
     // Load SAM 3.1 in ComfyUI now, so the first click previews quickly (once per server per Nuke session).
@@ -698,6 +830,33 @@ static OfxStatus createInstance(OfxImageEffectHandle effect) {
 static OfxStatus destroyInstance(OfxImageEffectHandle effect) {
     delete getInstance(effect);
     return kOfxStatOK;
+}
+
+static OfxStatus createInstanceAlpha(OfxImageEffectHandle effect) {
+    OfxStatus s = createInstance(effect);
+    if (s == kOfxStatOK) {
+        Instance* inst = getInstance(effect);
+        if (inst) inst->isCleanGen = false;
+    }
+    return s;
+}
+
+static OfxStatus createInstanceClean(OfxImageEffectHandle effect) {
+    OfxStatus s = createInstance(effect);
+    if (s == kOfxStatOK) {
+        Instance* inst = getInstance(effect);
+        if (inst) inst->isCleanGen = true;
+    }
+    return s;
+}
+
+static OfxStatus createInstanceLegacy(OfxImageEffectHandle effect) {
+    OfxStatus s = createInstance(effect);
+    if (s == kOfxStatOK) {
+        Instance* inst = getInstance(effect);
+        if (inst) inst->isCleanGen = false;
+    }
+    return s;
 }
 
 // Backend selection. Returns "" or an error to show.
@@ -822,6 +981,12 @@ static std::string buildJob(Instance* inst, double now, engine::Job& j, int& fir
     j.models.videoVae = getString(inst->videoVae);
     j.models.audioVae = getString(inst->audioVae);
     j.mode = getInt(inst->mode);
+    if (inst->isCleanGen) {
+        j.mode = engine::kClean;
+        j.cleanPlateOnly = true;
+    }
+    std::string exp = evaluateNukePath(getString(inst->exportDir));
+    j.exportDir = exp.empty() ? fs::path() : fs::path(exp);
     j.chunk = std::clamp(getInt(inst->chunk), 9, 145);
     j.blend = std::clamp(getInt(inst->blend), 0, 48);
     j.seed = getInt(inst->seed);
@@ -912,6 +1077,7 @@ static engine::Progress progressFor(OfxImageEffectHandle effect) {
 }
 
 // Start a hero-frame selection preview in the background and switch the viewer to it.
+static std::shared_ptr<Gray> matteFor(Instance* inst, double time);
 static void startPreview(OfxImageEffectHandle effect, Instance* inst, double now, bool quiet) {
     engine::Job j;
     int first = 0;
@@ -995,7 +1161,31 @@ static void doProcess(OfxImageEffectHandle effect, Instance* inst, double now) {
     }
     gParam->paramSetValue(inst->anaStart, first);
     gParam->paramSetValue(inst->anaCount, j.count);
-    gParam->paramSetValue(inst->show, (int)kShowMatte);
+    gParam->paramSetValue(inst->show, inst->isCleanGen ? 0 : (int)kShowMatte);
+
+    // Export sequences to disk
+    std::string exp = evaluateNukePath(getString(inst->exportDir));
+    fs::path expDir = exp.empty() ? fs::path() : fs::path(exp);
+    if (!expDir.empty()) {
+        std::error_code ec;
+        fs::create_directories(expDir, ec);
+        if (!inst->isCleanGen) {
+            for (int i = 0; i < j.count; ++i) {
+                std::shared_ptr<Gray> m = matteFor(inst, first + i);
+                if (m) {
+                    std::string errPng;
+                    fs::path outP = expDir / strf("matte_%04d.png", first + i);
+                    media::writePNG(outP.wstring(), *m, errPng);
+                }
+            }
+        }
+    }
+
+    if (getInt(inst->autoRead) && !expDir.empty()) {
+        std::string pattern = (expDir / (inst->isCleanGen ? "clean_plate_%04d.png" : "matte_%04d.png")).string();
+        spitReadNode(pattern, first, first + j.count - 1, inst->isCleanGen ? "Clean_Gen_Plate" : "Alpha_Gen_Matte", inst->isCleanGen ? "sRGB" : "linear");
+    }
+
     int secs = (int)((GetTickCount() - t0) / 1000);
     setStatus(inst, strf("processed %d-%d in %dm%02ds - %s", first, first + j.count - 1, secs / 60, secs % 60,
                          r.info.empty() ? "done" : r.info.c_str()));
@@ -1029,6 +1219,23 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
         startPreview(effect, inst, now, false);
     } else if (n == "process") {
         doProcess(effect, inst, now);
+    } else if (n == "spitRead") {
+        std::string exp = evaluateNukePath(getString(inst->exportDir));
+        if (exp.empty()) {
+            message(effect, kOfxMessageError, "Export sequence folder is empty.");
+            return kOfxStatOK;
+        }
+        int a = 0, b = 0;
+        if (getInt(inst->rangeMode) == kRangeCustom) {
+            a = getInt(inst->frameStart);
+            b = getInt(inst->frameEnd);
+        } else {
+            inputRange(inst, a, b);
+        }
+        if (b < a) std::swap(a, b);
+        std::string pattern = (fs::path(exp) / (inst->isCleanGen ? "clean_plate_%04d.png" : "matte_%04d.png")).string();
+        spitReadNode(pattern, a, b, inst->isCleanGen ? "Clean_Gen_Plate" : "Alpha_Gen_Matte", inst->isCleanGen ? "sRGB" : "linear");
+        return kOfxStatOK;
     } else if (n == "clearPoints") {
         gParam->paramSetValue(inst->points, "");
     } else if (n == "rangeMode") {
@@ -1457,6 +1664,25 @@ static OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
         return (float)((r0[x0] * (1 - ax) + r0[x1] * ax) * (1 - ay) + (r1[x0] * (1 - ax) + r1[x1] * ax) * ay);
     };
 
+    std::shared_ptr<engine::Frame> cleanFr;
+    if (inst->isCleanGen && show == 0) {
+        int anaStart = getInt(inst->anaStart), anaCount = getInt(inst->anaCount);
+        int idx = (int)std::lround(time) - anaStart;
+        if (anaCount > 0 && idx >= 0 && idx < anaCount) {
+            fs::path cleanP = sessionDir(inst) / strf("clean_%06d.png", idx);
+            std::error_code ec;
+            if (fs::exists(cleanP, ec)) {
+                cleanFr = std::make_shared<engine::Frame>();
+                std::string errPng;
+                std::ifstream f(cleanP, std::ios::binary);
+                if (f) {
+                    std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                    media::decodePNG(bytes, *cleanFr, errPng);
+                }
+            }
+        }
+    }
+
     for (int y = win.y1; y < win.y2; ++y) {
         if (gEffect->abort(effect)) break;
         if (y < d.bounds.y1 || y >= d.bounds.y2) continue;
@@ -1469,7 +1695,17 @@ static OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                 if (s.nComp == 4) srcA = pixelComp(s, x, y, 3);
             }
             float a = m ? sample(*m, x, y) : (analyzed ? 0.f : srcA);  // pass-through before processing
-            if (tint) {
+            if (cleanFr && !cleanFr->rgb.empty()) {
+                double fy = (1.0 - (y + 0.5 - ry1) / (ry2 - ry1)) * cleanFr->h - 0.5;
+                double fx = (x + 0.5 - rx1) / (rx2 - rx1) * cleanFr->w - 0.5;
+                int cy0 = std::clamp((int)std::floor(fy), 0, cleanFr->h - 1);
+                int cx0 = std::clamp((int)std::floor(fx), 0, cleanFr->w - 1);
+                size_t cidx = ((size_t)cy0 * cleanFr->w + cx0) * 3;
+                rgb[0] = cleanFr->rgb[cidx] / 255.0f;
+                rgb[1] = cleanFr->rgb[cidx + 1] / 255.0f;
+                rgb[2] = cleanFr->rgb[cidx + 2] / 255.0f;
+                a = 1.0f;
+            } else if (tint) {
                 for (size_t k = 0; k < tints.size(); ++k) {
                     if (!tints[k]) continue;
                     float w = 0.5f * sample(*tints[k], x, y);
@@ -1510,14 +1746,53 @@ static OfxStatus onLoad() {
     return (gProp && gEffect && gParam) ? kOfxStatOK : kOfxStatErrMissingHostFeature;
 }
 
-static OfxStatus mainEntry(const char* action, const void* handle, OfxPropertySetHandle inArgs,
-                           OfxPropertySetHandle outArgs) {
+static OfxStatus mainEntryAlpha(const char* action, const void* handle, OfxPropertySetHandle inArgs, OfxPropertySetHandle outArgs) {
     OfxImageEffectHandle effect = (OfxImageEffectHandle)handle;
     try {
         if (!strcmp(action, kOfxActionLoad)) return onLoad();
-        if (!strcmp(action, kOfxActionDescribe)) return describe(effect);
-        if (!strcmp(action, kOfxImageEffectActionDescribeInContext)) return describeInContext(effect, inArgs);
-        if (!strcmp(action, kOfxActionCreateInstance)) return createInstance(effect);
+        if (!strcmp(action, kOfxActionDescribe)) return describeAlpha(effect);
+        if (!strcmp(action, kOfxImageEffectActionDescribeInContext)) return describeInContextCommon(effect, false);
+        if (!strcmp(action, kOfxActionCreateInstance)) return createInstanceAlpha(effect);
+        if (!strcmp(action, kOfxActionDestroyInstance)) return destroyInstance(effect);
+        if (!strcmp(action, kOfxActionInstanceChanged)) return instanceChanged(effect, inArgs);
+        if (!strcmp(action, kOfxImageEffectActionGetClipPreferences)) return getClipPreferences(effect, outArgs);
+        if (!strcmp(action, kOfxImageEffectActionRender)) return render(effect, inArgs);
+    } catch (const std::exception& e) {
+        message(effect, kOfxMessageError, std::string("Alpha_Gen: ") + e.what());
+        return kOfxStatFailed;
+    } catch (...) {
+        return kOfxStatFailed;
+    }
+    return kOfxStatReplyDefault;
+}
+
+static OfxStatus mainEntryClean(const char* action, const void* handle, OfxPropertySetHandle inArgs, OfxPropertySetHandle outArgs) {
+    OfxImageEffectHandle effect = (OfxImageEffectHandle)handle;
+    try {
+        if (!strcmp(action, kOfxActionLoad)) return onLoad();
+        if (!strcmp(action, kOfxActionDescribe)) return describeClean(effect);
+        if (!strcmp(action, kOfxImageEffectActionDescribeInContext)) return describeInContextCommon(effect, true);
+        if (!strcmp(action, kOfxActionCreateInstance)) return createInstanceClean(effect);
+        if (!strcmp(action, kOfxActionDestroyInstance)) return destroyInstance(effect);
+        if (!strcmp(action, kOfxActionInstanceChanged)) return instanceChanged(effect, inArgs);
+        if (!strcmp(action, kOfxImageEffectActionGetClipPreferences)) return getClipPreferences(effect, outArgs);
+        if (!strcmp(action, kOfxImageEffectActionRender)) return render(effect, inArgs);
+    } catch (const std::exception& e) {
+        message(effect, kOfxMessageError, std::string("Clean_Gen: ") + e.what());
+        return kOfxStatFailed;
+    } catch (...) {
+        return kOfxStatFailed;
+    }
+    return kOfxStatReplyDefault;
+}
+
+static OfxStatus mainEntryLegacy(const char* action, const void* handle, OfxPropertySetHandle inArgs, OfxPropertySetHandle outArgs) {
+    OfxImageEffectHandle effect = (OfxImageEffectHandle)handle;
+    try {
+        if (!strcmp(action, kOfxActionLoad)) return onLoad();
+        if (!strcmp(action, kOfxActionDescribe)) return describeLegacy(effect);
+        if (!strcmp(action, kOfxImageEffectActionDescribeInContext)) return describeInContextCommon(effect, false);
+        if (!strcmp(action, kOfxActionCreateInstance)) return createInstanceLegacy(effect);
         if (!strcmp(action, kOfxActionDestroyInstance)) return destroyInstance(effect);
         if (!strcmp(action, kOfxActionInstanceChanged)) return instanceChanged(effect, inArgs);
         if (!strcmp(action, kOfxImageEffectActionGetClipPreferences)) return getClipPreferences(effect, outArgs);
@@ -1533,9 +1808,16 @@ static OfxStatus mainEntry(const char* action, const void* handle, OfxPropertySe
 
 static void setHost(OfxHost* h) { gHost = h; }
 
-static OfxPlugin gPlugin = {kOfxImageEffectPluginApi, 1, PLUGIN_ID, 1, 0, setHost, mainEntry};
+static OfxPlugin gPluginAlpha = {kOfxImageEffectPluginApi, 1, PLUGIN_ID_ALPHA, 1, 0, setHost, mainEntryAlpha};
+static OfxPlugin gPluginClean = {kOfxImageEffectPluginApi, 1, PLUGIN_ID_CLEAN, 1, 0, setHost, mainEntryClean};
+static OfxPlugin gPluginLegacy = {kOfxImageEffectPluginApi, 1, PLUGIN_ID_LEGACY, 1, 0, setHost, mainEntryLegacy};
 
 extern "C" {
-__declspec(dllexport) int OfxGetNumberOfPlugins(void) { return 1; }
-__declspec(dllexport) OfxPlugin* OfxGetPlugin(int nth) { return nth == 0 ? &gPlugin : nullptr; }
+__declspec(dllexport) int OfxGetNumberOfPlugins(void) { return 3; }
+__declspec(dllexport) OfxPlugin* OfxGetPlugin(int nth) {
+    if (nth == 0) return &gPluginAlpha;
+    if (nth == 1) return &gPluginClean;
+    if (nth == 2) return &gPluginLegacy;
+    return nullptr;
+}
 }

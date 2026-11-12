@@ -8,7 +8,7 @@ tasklist /fi "imagename eq Nuke*" 2>nul | find /i "Nuke" >nul && (
     pause
     exit /b 1
 )
-if exist "%DEST%\AlphaGenSAM.ofx.bundle" rmdir /s /q "%DEST%\AlphaGenSAM.ofx.bundle"
+if exist "%DEST%\GenTools.ofx.bundle" rmdir /s /q "%DEST%\GenTools.ofx.bundle"
 powershell -NoProfile -Command ^
   "$d = '%DEST%'; $v = [Environment]::GetEnvironmentVariable('OFX_PLUGIN_PATH','User');" ^
   "$parts = @($v -split ';' | Where-Object { $_ -and $_ -ne $d });" ^

@@ -75,6 +75,8 @@ struct Job {
     comfy::Server server;
     std::string session;  // per-node id; names uploads and output folders
     fs::path dir;         // local cache for this node (mattes as PFM)
+    fs::path exportDir;   // user-configured output folder for sequences
+    bool cleanPlateOnly = false;
     Models models;
     int W = 0, H = 0;     // working resolution (multiples of 32)
     int count = 0;        // frames in the analysed range

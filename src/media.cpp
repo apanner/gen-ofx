@@ -84,6 +84,49 @@ bool writePNG(const std::wstring& path, const Frame& fr, std::string& err) {
     return true;
 }
 
+bool writePNG(const std::wstring& path, const Gray& g, std::string& err) {
+    auto f = factory(err);
+    if (!f) return false;
+    ComPtr<IWICStream> stream;
+    ComPtr<IWICBitmapEncoder> enc;
+    ComPtr<IWICBitmapFrameEncode> frame;
+    HRESULT h = f->CreateStream(&stream);
+    if (SUCCEEDED(h)) h = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+    if (SUCCEEDED(h)) h = f->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc);
+    if (SUCCEEDED(h)) h = enc->Initialize(stream.Get(), WICBitmapEncoderNoCache);
+    if (SUCCEEDED(h)) h = enc->CreateNewFrame(&frame, nullptr);
+    if (SUCCEEDED(h)) h = frame->Initialize(nullptr);
+    if (SUCCEEDED(h)) h = frame->SetSize(g.w, g.h);
+    WICPixelFormatGUID fmt = GUID_WICPixelFormat16bppGray;
+    if (SUCCEEDED(h)) h = frame->SetPixelFormat(&fmt);
+    if (SUCCEEDED(h) && fmt != GUID_WICPixelFormat16bppGray) {
+        fmt = GUID_WICPixelFormat8bppGray;
+        h = frame->SetPixelFormat(&fmt);
+    }
+    if (SUCCEEDED(h) && fmt == GUID_WICPixelFormat16bppGray) {
+        std::vector<uint16_t> px16(g.px.size());
+        for (size_t i = 0; i < g.px.size(); ++i) {
+            float v = g.px[i] < 0.0f ? 0.0f : (g.px[i] > 1.0f ? 1.0f : g.px[i]);
+            px16[i] = (uint16_t)(v * 65535.0f + 0.5f);
+        }
+        h = frame->WritePixels(g.h, g.w * (UINT)sizeof(uint16_t), (UINT)(px16.size() * sizeof(uint16_t)), (BYTE*)px16.data());
+    } else if (SUCCEEDED(h)) {
+        std::vector<uint8_t> px8(g.px.size());
+        for (size_t i = 0; i < g.px.size(); ++i) {
+            float v = g.px[i] < 0.0f ? 0.0f : (g.px[i] > 1.0f ? 1.0f : g.px[i]);
+            px8[i] = (uint8_t)(v * 255.0f + 0.5f);
+        }
+        h = frame->WritePixels(g.h, g.w, (UINT)px8.size(), px8.data());
+    }
+    if (SUCCEEDED(h)) h = frame->Commit();
+    if (SUCCEEDED(h)) h = enc->Commit();
+    if (FAILED(h)) {
+        err = hr("PNG encode (gray)", h);
+        return false;
+    }
+    return true;
+}
+
 // Decode to 16-bit RGBA (keeps Alpha-Gen's 16-bit precision).
 static bool decodeRGBA16(const std::string& bytes, std::vector<uint16_t>& buf, UINT& w, UINT& ht, std::string& err) {
     auto f = factory(err);
