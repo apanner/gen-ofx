@@ -240,11 +240,18 @@ static void autoDerivePathInNuke(Instance* inst) {
         "def _gentools_derive():\n"
         "    try:\n"
         "        import nuke, os, re\n"
-        "        node = nuke.toNode('" + nName + "')\n"
+        "        is_clean = " + isCleanStr + "\n"
+        "        node = nuke.toNode('" + nName + "') if '" + nName + "' else None\n"
         "        if not node:\n"
-        "            cands = [n for n in nuke.allNodes() if 'Clean_Gen' in n.Class() or 'Alpha_Gen' in n.Class() or 'AlphaGenSAM' in n.Class()]\n"
+        "            want = 'clean_gen' if is_clean else 'alpha_gen'\n"
+        "            sel = [n for n in nuke.selectedNodes() if want in n.Class().lower() or 'alphagensam' in n.Class().lower()]\n"
+        "            cands = sel if sel else [n for n in nuke.allNodes() if want in n.Class().lower()]\n"
+        "            if not cands:\n"
+        "                cands = [n for n in nuke.allNodes() if any(k in n.Class().lower() for k in ('clean_gen', 'alpha_gen', 'alphagensam'))]\n"
         "            if cands: node = cands[-1]\n"
-        "        if not node: return\n"
+        "        if not node:\n"
+        "            print('[GenTools] auto-derive: no node found')\n"
+        "            return\n"
         "        curr = node.input(0)\n"
         "        visited = set()\n"
         "        read_node = None\n"
@@ -308,12 +315,16 @@ static void autoDerivePathInNuke(Instance* inst) {
         "    nuke.executeInMainThread(_gentools_derive)\n";
 
     std::string err;
-    runPythonScript(py, err);
+    if (!runPythonScript(py, err)) {
+        // Fallback silently if not in Nuke Python host
+        return;
+    }
 
-    const char* derived = getenv("_GENTOOLS_DERIVED_PATH");
-    if (derived && *derived) {
-        gParam->paramSetValue(inst->outputPath, derived);
-        _putenv("_GENTOOLS_DERIVED_PATH=");
+    char buf[4096];
+    DWORD len = GetEnvironmentVariableA("_GENTOOLS_DERIVED_PATH", buf, sizeof(buf));
+    if (len > 0 && len < sizeof(buf)) {
+        gParam->paramSetValue(inst->outputPath, buf);
+        SetEnvironmentVariableA("_GENTOOLS_DERIVED_PATH", nullptr);
     }
 }
 
@@ -328,22 +339,25 @@ static void spitReadNode(const std::string& nodeName, const std::string& outputP
         "def _gentools_spit_read():\n"
         "    try:\n"
         "        import nuke, os, re\n"
-        "        node = nuke.toNode('" + nodeName + "')\n"
+        "        is_clean = " + isCleanStr + "\n"
+        "        node = nuke.toNode('" + nodeName + "') if '" + nodeName + "' else None\n"
         "        if not node:\n"
-        "            cands = [n for n in nuke.allNodes() if 'Clean_Gen' in n.Class() or 'Alpha_Gen' in n.Class() or 'AlphaGenSAM' in n.Class()]\n"
+        "            want = 'clean_gen' if is_clean else 'alpha_gen'\n"
+        "            sel = [n for n in nuke.selectedNodes() if want in n.Class().lower() or 'alphagensam' in n.Class().lower()]\n"
+        "            cands = sel if sel else [n for n in nuke.allNodes() if want in n.Class().lower()]\n"
+        "            if not cands:\n"
+        "                cands = [n for n in nuke.allNodes() if any(k in n.Class().lower() for k in ('clean_gen', 'alpha_gen', 'alphagensam'))]\n"
         "            if cands: node = cands[-1]\n"
-        "        if not node: return\n"
         "        out_pattern = '" + clean + "'.replace('\\\\', '/')\n"
         "        out_dir = os.path.dirname(out_pattern)\n"
         "        if out_dir and not os.path.exists(out_dir):\n"
         "            os.makedirs(out_dir, exist_ok=True)\n"
         "        first_f = " + std::to_string(firstFrame) + "\n"
         "        last_f = " + std::to_string(lastFrame) + "\n"
-        "        is_clean = " + isCleanStr + "\n"
         "        ext = os.path.splitext(out_pattern)[1].lower()\n"
         "        for n in nuke.selectedNodes(): n.setSelected(False)\n"
         "        r = nuke.createNode('Read', inpanel=False)\n"
-        "        r['file'].fromUserText(out_pattern)\n"
+        "        r['file'].setValue(out_pattern)\n"
         "        r['first'].setValue(int(first_f))\n"
         "        r['last'].setValue(int(last_f))\n"
         "        r['origfirst'].setValue(int(first_f))\n"
@@ -351,18 +365,15 @@ static void spitReadNode(const std::string& nodeName, const std::string& outputP
         "        if ext == '.png':\n"
         "            try: r['colorspace'].setValue('sRGB' if is_clean else 'linear')\n"
         "            except Exception: pass\n"
-        "        r.setXYpos(node.xpos() + 200, node.ypos())\n"
+        "        if node:\n"
+        "            r.setXYpos(node.xpos() + 200, node.ypos())\n"
         "        lbl = ('Clean_Gen_Plate' if is_clean else 'Alpha_Gen_Matte') + '\\n[value first]-[value last]'\n"
         "        r['label'].setValue(lbl)\n"
         "        r.setSelected(True)\n"
-        "        print('[Gen Tools] Created Read node:', r.name(), '->', out_pattern)\n"
+        "        print('[Gen Tools] Created Read node:', r.name(), '->', out_pattern, f'({first_f}-{last_f})')\n"
         "    except Exception as e:\n"
         "        print('[Gen Tools] Error creating Read node:', e)\n"
-        "try:\n"
-        "    _gentools_spit_read()\n"
-        "except Exception:\n"
-        "    import nuke\n"
-        "    nuke.executeInMainThread(_gentools_spit_read)\n";
+        "_gentools_spit_read()\n";
 
     std::string err;
     runPythonScript(py, err);
@@ -393,6 +404,42 @@ static std::string getString(OfxParamHandle p, double t = 0) {
     const char* s = nullptr;
     gParam->paramGetValueAtTime(p, t, &s);
     return s ? s : "";
+}
+
+static std::string getRawOutputPattern(Instance* inst) {
+    std::string nName = inst->nodeName;
+    std::string isCleanStr = inst->isCleanGen ? "True" : "False";
+    std::string py =
+        "try:\n"
+        "    import nuke, os\n"
+        "    os.environ.pop('_GENTOOLS_RAW_OUT', None)\n"
+        "    is_clean = " + isCleanStr + "\n"
+        "    node = nuke.toNode('" + nName + "') if '" + nName + "' else None\n"
+        "    if not node:\n"
+        "        want = 'clean_gen' if is_clean else 'alpha_gen'\n"
+        "        sel = [n for n in nuke.selectedNodes() if want in n.Class().lower() or 'alphagensam' in n.Class().lower()]\n"
+        "        cands = sel if sel else [n for n in nuke.allNodes() if want in n.Class().lower()]\n"
+        "        if not cands:\n"
+        "            cands = [n for n in nuke.allNodes() if any(k in n.Class().lower() for k in ('clean_gen', 'alpha_gen', 'alphagensam'))]\n"
+        "        if cands: node = cands[-1]\n"
+        "    if node and 'outputPath' in node.knobs():\n"
+        "        val = str(node['outputPath'].value() or '')\n"
+        "        if '[' in val:\n"
+        "            try: val = nuke.tcl('subst', val)\n"
+        "            except Exception: pass\n"
+        "        os.environ['_GENTOOLS_RAW_OUT'] = val.replace('\\\\', '/')\n"
+        "except Exception:\n"
+        "    pass\n";
+    std::string err;
+    if (runPythonScript(py, err)) {
+        char buf[4096];
+        DWORD len = GetEnvironmentVariableA("_GENTOOLS_RAW_OUT", buf, sizeof(buf));
+        if (len > 0 && len < sizeof(buf)) {
+            SetEnvironmentVariableA("_GENTOOLS_RAW_OUT", nullptr);
+            return std::string(buf);
+        }
+    }
+    return evaluateNukePath(getString(inst->outputPath));
 }
 static int getInt(OfxParamHandle p, double t = 0) {
     int v = 0;
@@ -1037,10 +1084,6 @@ static OfxStatus createInstance(OfxImageEffectHandle effect) {
         inst->nodeName = nName;
     }
     gProp->propSetPointer(props, kOfxPropInstanceData, 0, inst);
-
-    if (getString(inst->outputPath).empty()) {
-        autoDerivePathInNuke(inst);
-    }
     return kOfxStatOK;
 }
 
@@ -1226,7 +1269,7 @@ static std::string buildJob(Instance* inst, double now, engine::Job& j, int& fir
         j.mode = engine::kClean;
         j.cleanPlateOnly = true;
     }
-    std::string outPat = evaluateNukePath(getString(inst->outputPath));
+    std::string outPat = getRawOutputPattern(inst);
     j.outputPattern = outPat;
     std::string exp = outPat.empty() ? evaluateNukePath(getString(inst->exportDir)) : outPat;
     fs::path expPath(exp);
@@ -1390,6 +1433,9 @@ static void startPreview(OfxImageEffectHandle effect, Instance* inst, double now
 }
 
 static void doProcess(OfxImageEffectHandle effect, Instance* inst, double now) {
+    if (getRawOutputPattern(inst).empty()) {
+        autoDerivePathInNuke(inst);
+    }
     engine::Job j;
     int first = 0;
     std::string err = buildJob(inst, now, j, first, false);
@@ -1419,25 +1465,51 @@ static void doProcess(OfxImageEffectHandle effect, Instance* inst, double now) {
     gParam->paramSetValue(inst->anaCount, j.count);
     gParam->paramSetValue(inst->show, inst->isCleanGen ? 0 : (int)kShowMatte);
 
-    // Export sequences to disk
-    std::string outPattern = getString(inst->outputPath);
+    // Export sequences to disk (never leave outputs trapped only in node cache)
+    std::string outPattern = !j.outputPattern.empty() ? j.outputPattern : getRawOutputPattern(inst);
     if (outPattern.empty()) {
         autoDerivePathInNuke(inst);
-        outPattern = getString(inst->outputPath);
+        outPattern = getRawOutputPattern(inst);
     }
     if (outPattern.empty()) {
         std::string exp = evaluateNukePath(getString(inst->exportDir));
         if (!exp.empty()) {
-            outPattern = (fs::path(exp) / (inst->isCleanGen ? "clean_plate_%04d.png" : "matte_%04d.png")).string();
+            outPattern = (fs::path(exp) / (inst->isCleanGen ? "clean_plate_%04d.exr" : "matte_%04d.exr")).string();
         }
     }
 
+    int writtenCount = 0;
+    std::string writeErr;
     if (!outPattern.empty()) {
         fs::path p(outPattern);
         fs::path expDir = p.has_extension() ? p.parent_path() : p;
         std::error_code ec;
         fs::create_directories(expDir, ec);
-        if (!inst->isCleanGen) {
+        if (inst->isCleanGen) {
+            for (int i = 0; i < j.count; ++i) {
+                fs::path outP = engine::formatFramePath(outPattern, first + i);
+                fs::create_directories(outP.parent_path(), ec);
+                if (!fs::exists(outP, ec) || fs::file_size(outP, ec) == 0) {
+                    fs::path cacheP = j.dir / strf("clean_%06d.png", i);
+                    std::string bytes, imgErr;
+                    engine::Frame fr;
+                    {
+                        std::ifstream ifs(cacheP, std::ios::binary);
+                        if (ifs) {
+                            bytes.assign(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
+                        }
+                    }
+                    if (!bytes.empty() && media::decodePNG(bytes, fr, imgErr)) {
+                        if (media::writeImage(outP.wstring(), fr, imgErr)) ++writtenCount;
+                        else if (writeErr.empty()) writeErr = imgErr;
+                    } else if (writeErr.empty()) {
+                        writeErr = imgErr.empty() ? ("missing clean frame " + cacheP.string()) : imgErr;
+                    }
+                } else {
+                    ++writtenCount;
+                }
+            }
+        } else {
             std::string ext = p.extension().string();
             for (char& ch : ext) ch = (char)std::tolower((unsigned char)ch);
             const bool wantMultipass = inst->multipassExr && getInt(inst->multipassExr) &&
@@ -1446,10 +1518,14 @@ static void doProcess(OfxImageEffectHandle effect, Instance* inst, double now) {
             const double bp = getDouble(inst->blackPt), wp = getDouble(inst->whitePt);
             for (int i = 0; i < j.count; ++i) {
                 std::shared_ptr<Gray> m = matteFor(inst, first + i);
-                if (!m) continue;
-                std::string errImg;
+                if (!m) {
+                    if (writeErr.empty()) writeErr = strf("missing matte for frame %d", first + i);
+                    continue;
+                }
+                std::string imgErr;
                 fs::path outP = engine::formatFramePath(outPattern, first + i);
                 fs::create_directories(outP.parent_path(), ec);
+                bool okWrite = false;
                 if (wantMultipass) {
                     auto plain = loadMatte(inst, j.dir, "ag", i);
                     std::vector<Gray> objMattes(j.objects.size());
@@ -1465,13 +1541,21 @@ static void doProcess(OfxImageEffectHandle effect, Instance* inst, double now) {
                     }
                     const engine::Frame* srcF = source(i);
                     if (!layers.empty()) {
-                        media::writeMultipassEXR(outP.wstring(), srcF, m.get(), layers, errImg);
-                        continue;
+                        okWrite = media::writeMultipassEXR(outP.wstring(), srcF, m.get(), layers, imgErr);
+                    } else {
+                        okWrite = media::writeImage(outP.wstring(), *m, imgErr);
                     }
+                } else {
+                    okWrite = media::writeImage(outP.wstring(), *m, imgErr);
                 }
-                media::writeImage(outP.wstring(), *m, errImg);
+                if (okWrite) ++writtenCount;
+                else if (writeErr.empty()) writeErr = imgErr;
             }
         }
+    }
+
+    if (!writeErr.empty() && writtenCount == 0) {
+        message(effect, kOfxMessageError, "Output export failed:\n" + writeErr + "\nPath: " + outPattern);
     }
 
     if (getInt(inst->autoRead) && !outPattern.empty()) {
@@ -1479,8 +1563,8 @@ static void doProcess(OfxImageEffectHandle effect, Instance* inst, double now) {
     }
 
     int secs = (int)((GetTickCount() - t0) / 1000);
-    setStatus(inst, strf("processed %d-%d in %dm%02ds - %s", first, first + j.count - 1, secs / 60, secs % 60,
-                         r.info.empty() ? "done" : r.info.c_str()));
+    setStatus(inst, strf("processed %d-%d in %dm%02ds (%d files) - %s", first, first + j.count - 1,
+                         secs / 60, secs % 60, writtenCount, r.info.empty() ? "done" : r.info.c_str()));
     bumpCache(inst);
 }
 
@@ -1515,10 +1599,10 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
         autoDerivePathInNuke(inst);
         return kOfxStatOK;
     } else if (n == "spitRead") {
-        std::string outPattern = evaluateNukePath(getString(inst->outputPath));
+        std::string outPattern = getRawOutputPattern(inst);
         if (outPattern.empty()) {
             autoDerivePathInNuke(inst);
-            outPattern = evaluateNukePath(getString(inst->outputPath));
+            outPattern = getRawOutputPattern(inst);
         }
         if (outPattern.empty()) {
             std::string exp = evaluateNukePath(getString(inst->exportDir));
