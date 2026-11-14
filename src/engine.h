@@ -54,9 +54,13 @@ struct Object {
     std::vector<Point> points;
     std::vector<Key> keys;
     int slot = 0;         // clicked objects: their number in the viewer (1-based)
+    std::string layerName; // optional custom EXR layer name (e.g. "hero", "car")
     bool output = true;   // false: only removed from the other objects' plates (and cuts their holes)
     bool clicked() const { return !points.empty() || !keys.empty(); }
-    std::string label() const { return !clicked() ? "\"" + text + "\"" : "clicked object " + std::to_string(slot); }
+    std::string label() const {
+        if (!layerName.empty()) return layerName;
+        return !clicked() ? "\"" + text + "\"" : "object " + std::to_string(slot);
+    }
 };
 
 struct Models {
@@ -92,6 +96,8 @@ struct Job {
     int chunk = 121;      // Alpha-Gen frames per chunk (model max 145)
     int blend = 16;       // frames of overlap cross-faded between chunks
     int seed = 42;
+    bool edgeDecontaminate = false; // soft-edge color decontamination (clean-plate delta)
+    bool useEmptyPrompt = false;    // skip text encoder when prompt text is not needed
 };
 
 static inline fs::path formatFramePath(const std::string& pattern, int frame) {
@@ -133,6 +139,9 @@ struct Result {
     std::string error;
     std::string info;
 };
+
+// Pre-flight validation (min 9 frames for LTX-2.5, chunk 8n+1 alignment, etc.). "" if valid.
+std::string validateJob(const Job& j, bool forPreview);
 
 // Check every model the job needs exists on the server (an imported model may carry a
 // prefix, e.g. "Lightricks__repo__file.safetensors": matched by its file name) and

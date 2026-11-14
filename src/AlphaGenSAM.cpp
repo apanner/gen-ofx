@@ -93,7 +93,7 @@ struct Instance {
     bool isCleanGen = false;
     std::string nodeName;
     OfxImageClipHandle src = nullptr, dst = nullptr;
-    OfxParamHandle select, points, autoPreview, rangeMode, frameStart, frameEnd, show, debug, status;
+    OfxParamHandle select, points, activeObject, objectNames, multipassExr, autoPreview, rangeMode, frameStart, frameEnd, show, debug, status;
     OfxParamHandle mode, workRes, chunk, blend, seed, colour, detThresh, others, reach, blackPt, whitePt;
     OfxParamHandle backend, cloudKey, serverUrl, samModel, unetModel, icLora, textEnc, videoVae, audioVae, cacheDir;
     OfxParamHandle session, anaStart, anaCount, cacheVersion;
@@ -746,14 +746,14 @@ static OfxStatus describePlugin(OfxImageEffectHandle effect, const char* label, 
 
 static OfxStatus describeAlpha(OfxImageEffectHandle effect) {
     return describePlugin(effect, PLUGIN_LABEL_ALPHA,
-                          "Gen Tools Alpha_Gen: AI Rotoscoping and sub-pixel soft edge matting with multi-layer separation "
-                          "powered by SAM 3.1 and LTX-2.5 Alpha-Gen.");
+                          "Gen Tools Alpha_Gen v1.1: Multi-object AI Rotoscoping, sub-pixel soft edge matting, "
+                          "and multipass EXR layer output powered by SAM 3.1 and LTX-2.5 Alpha-Gen.");
 }
 
 static OfxStatus describeClean(OfxImageEffectHandle effect) {
     return describePlugin(effect, PLUGIN_LABEL_CLEAN,
-                          "Gen Tools Clean_Gen: AI Clean Plate generation, wire/rig and object removal "
-                          "powered by SAM 3.1 and LTX-2.5 Clean-Plate IC-LoRA.");
+                          "Gen Tools Clean_Gen v1.1: Multi-object AI Clean Plate generation, wire/rig "
+                          "and object removal powered by SAM 3.1 and LTX-2.5 Clean-Plate IC-LoRA.");
 }
 
 static OfxStatus describeLegacy(OfxImageEffectHandle effect) {
@@ -807,6 +807,15 @@ static OfxStatus describeInContextCommon(OfxImageEffectHandle effect, bool isCle
                   nullptr, "");
     }
 
+    defChoice(ps, "activeObject", "active click object",
+              "Which object slot (1-6) receives Ctrl+click points in the viewer. Each object gets its own colour and EXR layer.",
+              nullptr, {"1 (Green)", "2 (Orange)", "3 (Cyan)", "4 (Magenta)", "5 (Yellow)", "6 (Purple)"}, 0);
+    if (!isCleanGen) {
+        defString(ps, "objectNames", "layer names",
+                  "Optional comma-separated EXR layer names for clicked objects 1-6 (e.g. hero, car, prop). "
+                  "Empty slots default to obj1, obj2, ...",
+                  nullptr, "");
+    }
     defString(ps, "points", "points", nullptr, nullptr, "", kOfxParamStringIsSingleLine, true);
     defDivider(ps, "clearPoints", "Clear Points", "Remove all clicked points", kOfxParamTypePushButton);
     defString(ps, "howto3", "", nullptr, nullptr, "2  Check the selection on this frame:", kOfxParamStringIsLabel);
@@ -834,6 +843,11 @@ static OfxStatus describeInContextCommon(OfxImageEffectHandle effect, bool isCle
               nullptr);
     defBool(ps, "autoRead", "auto create Read node",
             "Automatically export and create a Nuke Read node when processing finishes", nullptr, true);
+    if (!isCleanGen) {
+        defBool(ps, "multipassExr", "multipass EXR layers",
+                "When exporting .exr with multiple objects, write all objects into one multipass EXR (rgba + <layer>.rgba)",
+                nullptr, true);
+    }
     defDivider(ps, "spitRead", "Spit Read Node",
                "Export / link a Nuke Read node pointing to the output sequence on disk",
                kOfxParamTypePushButton);
@@ -991,6 +1005,9 @@ static OfxStatus createInstance(OfxImageEffectHandle effect) {
     inst->exportDir = ph(ps, "exportDir");
     inst->autoRead = ph(ps, "autoRead");
     inst->spitRead = ph(ps, "spitRead");
+    inst->activeObject = ph(ps, "activeObject");
+    inst->objectNames = inst->isCleanGen ? nullptr : ph(ps, "objectNames");
+    inst->multipassExr = inst->isCleanGen ? nullptr : ph(ps, "multipassExr");
 
     GenToolsSettings cfg = loadSettings();
     gParam->paramSetValue(inst->backend, cfg.backend);
@@ -1166,6 +1183,30 @@ static std::string backendServer(Instance* inst, comfy::Server& s) {
     return "";
 }
 
+static std::string sanitizeLayerName(const std::string& raw, const std::string& fallback,
+                                     std::vector<std::string>& used) {
+    std::string base;
+    for (unsigned char c : raw) {
+        if (std::isalnum(c) || c == '_') base += (char)c;
+        else if (!base.empty() && base.back() != '_') base += '_';
+    }
+    while (!base.empty() && base.front() == '_') base.erase(base.begin());
+    while (!base.empty() && base.back() == '_') base.pop_back();
+    if (base.empty()) base = fallback;
+    if (!base.empty() && std::isdigit((unsigned char)base[0])) base = "s_" + base;
+    std::string lower = base;
+    for (char& c : lower) c = (char)std::tolower((unsigned char)c);
+    if (lower == "rgba" || lower == "rgb" || lower == "alpha" || lower == "depth" || lower == "mask" ||
+        lower == "forward" || lower == "backward" || lower == "motion" || lower == "none" || lower == "all") {
+        base += "_obj";
+    }
+    std::string cand = base;
+    int n = 2;
+    while (std::find(used.begin(), used.end(), cand) != used.end()) cand = base + "_" + std::to_string(n++);
+    used.push_back(cand);
+    return cand;
+}
+
 // Gather params + geometry into an engine job. now = current frame. Returns "" or an error.
 static std::string buildJob(Instance* inst, double now, engine::Job& j, int& first, bool forPreview) {
     std::string err = backendServer(inst, j.server);
@@ -1228,16 +1269,21 @@ static std::string buildJob(Instance* inst, double now, engine::Job& j, int& fir
         return "Input is not connected.";
     workingSize(rod, std::min(getInt(inst->workRes), 1920), j.W, j.H);
 
+    std::vector<std::string> usedLayers;
+    std::vector<std::string> customNames = inst->objectNames ? splitTerms(getString(inst->objectNames)) : std::vector<std::string>{};
     for (const std::string& t : splitTerms(getString(inst->select))) {
         engine::Object o;
         o.text = t;
+        o.layerName = sanitizeLayerName(t, "term", usedLayers);
         j.objects.push_back(o);
     }
     std::vector<int> tint;  // preview colour per object: clicked n -> n-1, typed -> 6+
     for (size_t t = 0; t < j.objects.size(); ++t) tint.push_back(kClickObjects + (int)t);
-    for (int slot = 1; slot <= 1; ++slot) {
+    for (int slot = 1; slot <= kClickObjects; ++slot) {
         engine::Object clicked;
         clicked.slot = slot;
+        std::string rawName = (slot - 1 < (int)customNames.size()) ? customNames[slot - 1] : "";
+        clicked.layerName = sanitizeLayerName(rawName, "obj" + std::to_string(slot), usedLayers);
         bool anyPositive = false;
         std::map<int, engine::Key> keys;  // per frame
         for (const VPoint& p : pts) {
@@ -1257,8 +1303,8 @@ static std::string buildJob(Instance* inst, double now, engine::Job& j, int& fir
             clicked.keys.push_back(key);
         }
         if ((int)clicked.keys.size() > engine::kMaxKeys)
-            return strf("Your clicks are on %d frames; the most is %d (Alt+click to delete some).",
-                        (int)clicked.keys.size(), engine::kMaxKeys);
+            return strf("Object %d has clicks on %d frames; the most is %d (Alt+click to delete some).",
+                        slot, (int)clicked.keys.size(), engine::kMaxKeys);
         anyPositive = forPreview ? !clicked.points.empty() : !clicked.keys.empty();
         if (!forPreview && clicked.points.empty() && !clicked.keys.empty()) clicked.points = clicked.keys[0].points;
         if (anyPositive) {
@@ -1284,7 +1330,10 @@ static engine::Progress progressFor(OfxImageEffectHandle effect) {
 }
 
 // Start a hero-frame selection preview in the background and switch the viewer to it.
+static std::shared_ptr<Gray> loadMatte(Instance* inst, const fs::path& dir, const std::string& kind, int idx);
 static std::shared_ptr<Gray> matteFor(Instance* inst, double time);
+static Gray composeObjectMatte(Instance* inst, const fs::path& dir, int idx, int k, int mode, int reach, double bp,
+                               double wp, const std::shared_ptr<Gray>& plain);
 static void startPreview(OfxImageEffectHandle effect, Instance* inst, double now, bool quiet) {
     engine::Job j;
     int first = 0;
@@ -1389,14 +1438,38 @@ static void doProcess(OfxImageEffectHandle effect, Instance* inst, double now) {
         std::error_code ec;
         fs::create_directories(expDir, ec);
         if (!inst->isCleanGen) {
+            std::string ext = p.extension().string();
+            for (char& ch : ext) ch = (char)std::tolower((unsigned char)ch);
+            const bool wantMultipass = inst->multipassExr && getInt(inst->multipassExr) &&
+                                       ext == ".exr" && j.objects.size() > 1;
+            const int mode = getInt(inst->mode), reach = getInt(inst->reach);
+            const double bp = getDouble(inst->blackPt), wp = getDouble(inst->whitePt);
             for (int i = 0; i < j.count; ++i) {
                 std::shared_ptr<Gray> m = matteFor(inst, first + i);
-                if (m) {
-                    std::string errPng;
-                    fs::path outP = engine::formatFramePath(outPattern, first + i);
-                    fs::create_directories(outP.parent_path(), ec);
-                    media::writeImage(outP.wstring(), *m, errPng);
+                if (!m) continue;
+                std::string errImg;
+                fs::path outP = engine::formatFramePath(outPattern, first + i);
+                fs::create_directories(outP.parent_path(), ec);
+                if (wantMultipass) {
+                    auto plain = loadMatte(inst, j.dir, "ag", i);
+                    std::vector<Gray> objMattes(j.objects.size());
+                    std::vector<media::ExrLayer> layers;
+                    for (size_t k = 0; k < j.objects.size(); ++k) {
+                        if (!j.objects[k].output) continue;
+                        objMattes[k] = composeObjectMatte(inst, j.dir, i, (int)k, mode, reach, bp, wp, plain);
+                        if (!objMattes[k].px.empty()) {
+                            std::string lname = j.objects[k].layerName.empty() ? ("obj" + std::to_string(k + 1))
+                                                                               : j.objects[k].layerName;
+                            layers.push_back({lname, nullptr, &objMattes[k]});
+                        }
+                    }
+                    const engine::Frame* srcF = source(i);
+                    if (!layers.empty()) {
+                        media::writeMultipassEXR(outP.wstring(), srcF, m.get(), layers, errImg);
+                        continue;
+                    }
                 }
+                media::writeImage(outP.wstring(), *m, errImg);
             }
         }
     }
@@ -1586,18 +1659,21 @@ static OfxStatus overlayDraw(const void* handle, OfxPropertySetHandle inArgs) {
     std::vector<VPoint> pts = inst->dragIndex >= 0 ? inst->dragPoints : parsePoints(getString(inst->points));
     if (pts.empty()) return kOfxStatOK;
     const int frame = (int)std::lround(t);
+    const int activeSlot = std::clamp(getInt(inst->activeObject) + 1, 1, kClickObjects);
     glPushAttrib(GL_ALL_ATTRIB_BITS);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_LINE_SMOOTH);
-    const double R = 9.0;  // marker radius in screen pixels
     for (size_t i = 0; i < pts.size(); ++i) {
         const VPoint& p = pts[i];
+        const bool isActive = (p.obj == activeSlot);
+        const double R = isActive ? 9.5 : 8.0;  // active object points are slightly larger
+        const float alpha = isActive ? 1.0f : 0.78f;
         const bool live = false;  // every frame's points count (keyframes); other frames show as rings
         if (p.frame != frame) {  // a key on another frame: thin ring only
-            glLineWidth(1.5f);
+            glLineWidth(isActive ? 2.0f : 1.5f);
             const float* col = p.positive ? kTint[(p.obj - 1) % 12] : nullptr;
-            if (col) glColor4f(col[0], col[1], col[2], live ? 0.9f : 0.35f);
+            if (col) glColor4f(col[0], col[1], col[2], live ? 0.9f : (isActive ? 0.48f : 0.28f));
             else glColor4f(1.f, 0.35f, 0.3f, live ? 0.9f : 0.35f);
             ring(p.x, p.y, R * sx, R * sy);
             continue;
@@ -1605,13 +1681,18 @@ static OfxStatus overlayDraw(const void* handle, OfxPropertySetHandle inArgs) {
         const float* col = kTint[(p.obj - 1) % 12];
         glColor4f(0.f, 0.f, 0.f, 0.85f);  // dark halo so it reads on any plate
         disc(p.x, p.y, (R + 3) * sx, (R + 3) * sy);
+        if (isActive) {
+            glLineWidth(1.5f);
+            glColor4f(1.f, 1.f, 1.f, 0.9f);
+            ring(p.x, p.y, (R + 4.5) * sx, (R + 4.5) * sy);
+        }
         if (p.positive) {
-            glColor4f(col[0], col[1], col[2], 1.f);  // the click object's colour
+            glColor4f(col[0], col[1], col[2], alpha);  // the click object's colour
             disc(p.x, p.y, R * sx, R * sy);
         } else {  // exclude: red, ringed in the object's colour
-            glColor4f(col[0], col[1], col[2], 1.f);
+            glColor4f(col[0], col[1], col[2], alpha);
             disc(p.x, p.y, R * sx, R * sy);
-            glColor4f(1.f, 0.25f, 0.2f, 1.f);
+            glColor4f(1.f, 0.25f, 0.2f, alpha);
             disc(p.x, p.y, (R - 3) * sx, (R - 3) * sy);
         }
         glColor4f(0.f, 0.f, 0.f, 1.f);  // + / - glyph
@@ -1665,12 +1746,13 @@ static OfxStatus overlayPen(const char* action, const void* handle, OfxPropertyS
         std::vector<VPoint> pts = parsePoints(getString(inst->points));
         int hit = nearestPoint(pts, pos[0], pos[1], sx, sy, frame);
         if (keyDown(VK_CONTROL)) {
+            int activeSlot = std::clamp(getInt(inst->activeObject) + 1, 1, kClickObjects);
             VPoint p;
             p.x = pos[0];
             p.y = pos[1];
             p.positive = !keyDown(VK_SHIFT);
             p.frame = frame;
-            p.obj = 1;
+            p.obj = activeSlot;
             pts.push_back(p);
             commitPoints(effect, inst, pts, p.positive ? "Add point" : "Add exclude point");
             gInteract->interactRedraw((OfxInteractHandle)handle);
@@ -1782,6 +1864,22 @@ static int matteSource(Instance* inst, double time) {
 // Which processed objects this node outputs (its whole selection).
 static std::vector<int> renderOutputs(Instance*, const fs::path& dir) { return engine::outputObjects(dir); }
 
+static Gray composeObjectMatte(Instance* inst, const fs::path& dir, int idx, int k, int mode, int reach, double bp,
+                               double wp, const std::shared_ptr<Gray>& plain) {
+    auto sel = loadMatte(inst, dir, engine::selKind(k), idx);
+    if (engine::pass2Kind(dir, k) == "clean") {
+        auto clean = loadMatte(inst, dir, engine::fillKind(k), idx);
+        if (!clean) clean = loadMatte(inst, dir, engine::cleanKind(k), idx);
+        if (!clean || !sel) return {};
+        auto hole = loadMatte(inst, dir, engine::holeKind(k), idx);
+        return engine::composeClean(*clean, hole.get(), *sel, reach, bp, wp);
+    }
+    auto iso = loadMatte(inst, dir, engine::isoKind(k), idx);
+    auto oth = loadMatte(inst, dir, engine::othKind(k), idx);
+    return engine::composeFinal(mode, plain.get(), iso.get(), sel.get(), oth.get(), reach, bp, wp,
+                                engine::pass2Steered(dir, k));
+}
+
 static std::shared_ptr<Gray> matteFor(Instance* inst, double time) {
     int out = matteSource(inst, time);
     fs::path dir = sessionDir(inst);
@@ -1824,20 +1922,7 @@ static std::shared_ptr<Gray> matteFor(Instance* inst, double time) {
         }
         for (int k : renderOutputs(inst, dir)) {  // each object composed on its own, then merged
             if (k >= K) continue;
-            auto sel = loadMatte(inst, dir, engine::selKind(k), idx);
-            if (engine::pass2Kind(dir, k) == "clean") {
-                auto clean = loadMatte(inst, dir, engine::fillKind(k), idx);
-                if (!clean) clean = loadMatte(inst, dir, engine::cleanKind(k), idx);
-                if (!clean || !sel) continue;
-                auto hole = loadMatte(inst, dir, engine::holeKind(k), idx);
-                Gray f = engine::composeClean(*clean, hole.get(), *sel, reach, bp, wp);
-                if (!f.px.empty()) unionInto(acc, f);
-                continue;
-            }
-            auto iso = loadMatte(inst, dir, engine::isoKind(k), idx);
-            auto oth = loadMatte(inst, dir, engine::othKind(k), idx);
-            Gray f = engine::composeFinal(mode, plain.get(), iso.get(), sel.get(), oth.get(), reach, bp, wp,
-                                          engine::pass2Steered(dir, k));
+            Gray f = composeObjectMatte(inst, dir, idx, k, mode, reach, bp, wp, plain);
             if (!f.px.empty()) unionInto(acc, f);
         }
         return acc;
@@ -2052,8 +2137,8 @@ static OfxStatus mainEntryLegacy(const char* action, const void* handle, OfxProp
 
 static void setHost(OfxHost* h) { gHost = h; }
 
-static OfxPlugin gPluginAlpha = {kOfxImageEffectPluginApi, 1, PLUGIN_ID_ALPHA, 1, 0, setHost, mainEntryAlpha};
-static OfxPlugin gPluginClean = {kOfxImageEffectPluginApi, 1, PLUGIN_ID_CLEAN, 1, 0, setHost, mainEntryClean};
+static OfxPlugin gPluginAlpha = {kOfxImageEffectPluginApi, 1, PLUGIN_ID_ALPHA, 1, 1, setHost, mainEntryAlpha};
+static OfxPlugin gPluginClean = {kOfxImageEffectPluginApi, 1, PLUGIN_ID_CLEAN, 1, 1, setHost, mainEntryClean};
 static OfxPlugin gPluginLegacy = {kOfxImageEffectPluginApi, 1, PLUGIN_ID_LEGACY, 1, 0, setHost, mainEntryLegacy};
 
 extern "C" {

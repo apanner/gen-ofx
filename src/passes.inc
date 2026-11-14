@@ -210,8 +210,16 @@
         // object that touches one (its own matte cuts the holes it makes)
         std::vector<char> needPass(K, 0);
         {
-            std::ofstream outF(j.dir / "outputs.txt"), names(j.dir / "object_names.txt");
-            for (int k = 0; k < K; ++k) names << j.objects[k].slot << "\t" << j.objects[k].text << "\n";
+            std::ofstream outF(j.dir / "outputs.txt"), names(j.dir / "object_names.txt"),
+                layersF(j.dir / "layer_names.txt");
+            for (int k = 0; k < K; ++k) {
+                names << j.objects[k].slot << "\t" << j.objects[k].text << "\n";
+                std::string ln = j.objects[k].layerName;
+                if (ln.empty()) {
+                    ln = j.objects[k].clicked() ? ("obj" + std::to_string(j.objects[k].slot)) : j.objects[k].text;
+                }
+                layersF << ln << "\n";
+            }
             for (int k = 0; k < K; ++k)
                 if (j.objects[k].output) {
                     needPass[k] = 1;

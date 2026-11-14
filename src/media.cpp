@@ -11,6 +11,7 @@
 
 #include "media.h"
 
+#include <algorithm>
 #include <mutex>
 
 using Microsoft::WRL::ComPtr;
@@ -424,6 +425,136 @@ bool writeEXR(const std::wstring& path, const Gray& g, std::string& err) {
             rowA[x] = floatToHalf(srcRow[x]);
         }
         fwrite(rowA.data(), 2, w, fp);
+    }
+    fclose(fp);
+    return true;
+}
+
+bool writeMultipassEXR(const std::wstring& path, const Frame* baseRgb, const Gray* baseAlpha,
+                       const std::vector<ExrLayer>& layers, std::string& err) {
+    int w = baseRgb ? baseRgb->w : (baseAlpha ? baseAlpha->w : 0);
+    int h = baseRgb ? baseRgb->h : (baseAlpha ? baseAlpha->h : 0);
+    if (w <= 0 || h <= 0) {
+        for (const auto& l : layers) {
+            if (l.alpha && l.alpha->w > 0 && l.alpha->h > 0) {
+                w = l.alpha->w;
+                h = l.alpha->h;
+                break;
+            }
+        }
+    }
+    if (w <= 0 || h <= 0) {
+        err = "Invalid dimensions for multipass EXR";
+        return false;
+    }
+
+    struct ExrCh {
+        std::string name;
+        int kind;  // 0=R, 1=G, 2=B, 3=A
+        const Frame* rgb;
+        const Gray* alpha;
+        bool premult;
+    };
+    std::vector<ExrCh> channels;
+    if (baseRgb && baseRgb->w == w && baseRgb->h == h) {
+        channels.push_back({"R", 0, baseRgb, nullptr, false});
+        channels.push_back({"G", 1, baseRgb, nullptr, false});
+        channels.push_back({"B", 2, baseRgb, nullptr, false});
+    }
+    if (baseAlpha && baseAlpha->w == w && baseAlpha->h == h) {
+        channels.push_back({"A", 3, nullptr, baseAlpha, false});
+    }
+    for (const auto& l : layers) {
+        if (l.name.empty() || !l.alpha || l.alpha->w != w || l.alpha->h != h) continue;
+        const Frame* srcRgb = (l.rgb && l.rgb->w == w && l.rgb->h == h) ? l.rgb
+                              : (baseRgb && baseRgb->w == w && baseRgb->h == h ? baseRgb : nullptr);
+        if (srcRgb) {
+            bool pm = (l.rgb == nullptr);
+            channels.push_back({l.name + ".R", 0, srcRgb, l.alpha, pm});
+            channels.push_back({l.name + ".G", 1, srcRgb, l.alpha, pm});
+            channels.push_back({l.name + ".B", 2, srcRgb, l.alpha, pm});
+        }
+        channels.push_back({l.name + ".A", 3, nullptr, l.alpha, false});
+    }
+    if (channels.empty()) {
+        err = "No valid channels for multipass EXR";
+        return false;
+    }
+
+    // OpenEXR requires chlist and scanline channel blocks to be sorted lexicographically by name.
+    std::sort(channels.begin(), channels.end(),
+              [](const ExrCh& a, const ExrCh& b) { return a.name < b.name; });
+
+    std::vector<uint8_t> hdr;
+    uint32_t magic = 0x01312f76, ver = 2;
+    const uint8_t* m = (const uint8_t*)&magic; hdr.insert(hdr.end(), m, m + 4);
+    const uint8_t* v = (const uint8_t*)&ver; hdr.insert(hdr.end(), v, v + 4);
+
+    std::vector<uint8_t> chList;
+    for (const auto& c : channels) {
+        for (char ch : c.name) chList.push_back((uint8_t)ch);
+        chList.push_back(0);
+        int32_t ptype = 1;  // HALF
+        const uint8_t* pt = (const uint8_t*)&ptype; chList.insert(chList.end(), pt, pt + 4);
+        chList.push_back(0); chList.push_back(0); chList.push_back(0); chList.push_back(0);
+        int32_t xSamp = 1, ySamp = 1;
+        const uint8_t* xs = (const uint8_t*)&xSamp; chList.insert(chList.end(), xs, xs + 4);
+        const uint8_t* ys = (const uint8_t*)&ySamp; chList.insert(chList.end(), ys, ys + 4);
+    }
+    chList.push_back(0);
+    addExrAttr(hdr, "channels", "chlist", chList.data(), (uint32_t)chList.size());
+
+    int8_t comp = 0;
+    addExrAttr(hdr, "compression", "compression", &comp, 1);
+    int32_t box[4] = {0, 0, w - 1, h - 1};
+    addExrAttr(hdr, "dataWindow", "box2i", box, 16);
+    addExrAttr(hdr, "displayWindow", "box2i", box, 16);
+    int8_t lineOrder = 0;
+    addExrAttr(hdr, "lineOrder", "lineOrder", &lineOrder, 1);
+    float par = 1.0f;
+    addExrAttr(hdr, "pixelAspectRatio", "float", &par, 4);
+    float center[2] = {0.0f, 0.0f};
+    addExrAttr(hdr, "screenWindowCenter", "v2f", center, 8);
+    float swidth = 1.0f;
+    addExrAttr(hdr, "screenWindowWidth", "float", &swidth, 4);
+    hdr.push_back(0);
+
+    uint64_t tablePos = hdr.size();
+    uint64_t lineDataStart = tablePos + (uint64_t)h * 8;
+    uint32_t rowDataSize = (uint32_t)w * 2 * (uint32_t)channels.size();
+    uint64_t scanlineTotal = 4 + 4 + rowDataSize;
+
+    std::vector<uint64_t> offsets(h);
+    for (int y = 0; y < h; ++y) offsets[y] = lineDataStart + (uint64_t)y * scanlineTotal;
+
+    FILE* fp = _wfopen(path.c_str(), L"wb");
+    if (!fp) {
+        err = "Could not create multipass EXR file";
+        return false;
+    }
+    fwrite(hdr.data(), 1, hdr.size(), fp);
+    fwrite(offsets.data(), 8, h, fp);
+
+    std::vector<uint16_t> rowBuf(w);
+    for (int y = 0; y < h; ++y) {
+        int32_t lineNum = y;
+        fwrite(&lineNum, 4, 1, fp);
+        fwrite(&rowDataSize, 4, 1, fp);
+        for (const auto& c : channels) {
+            if (c.kind == 3) {
+                const float* src = &c.alpha->px[(size_t)y * w];
+                for (int x = 0; x < w; ++x) rowBuf[x] = floatToHalf(src[x]);
+            } else {
+                const uint8_t* src = &c.rgb->rgb[(size_t)y * w * 3];
+                const float* aRow = c.premult && c.alpha ? &c.alpha->px[(size_t)y * w] : nullptr;
+                for (int x = 0; x < w; ++x) {
+                    float vlin = src[x * 3 + c.kind] / 255.0f;
+                    if (aRow) vlin *= aRow[x];
+                    rowBuf[x] = floatToHalf(vlin);
+                }
+            }
+            fwrite(rowBuf.data(), 2, w, fp);
+        }
     }
     fclose(fp);
     return true;

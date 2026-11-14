@@ -677,6 +677,17 @@ std::vector<int> outputObjects(const fs::path& dir) {
     return out;
 }
 
+std::string validateJob(const Job& j, bool forPreview) {
+    if (forPreview) return "";
+    if (!j.cleanPlateOnly && j.mode != kSelectionOnly && j.count < 9) {
+        return strf("LTX-2.5 Alpha-Gen requires at least 9 frames (got %d). Increase the frame range.", j.count);
+    }
+    if (j.chunk < 9 || j.chunk > 145) {
+        return strf("Frames per chunk must be between 9 and 145 (got %d).", j.chunk);
+    }
+    return "";
+}
+
 std::string resolveModels(Job& j, bool needSam, bool needLtx, bool needClean, bool needDepth) {
     struct Need {
         bool want;
@@ -798,6 +809,14 @@ static bool depthPass(Ctx& c, const FrameSource& frames);
 
 Result analyze(const Job& jIn, const FrameSource& frames, const Progress& p) {
     Job j = jIn;
+    {
+        std::string verr = validateJob(j, false);
+        if (!verr.empty()) {
+            Result r;
+            r.error = verr;
+            return r;
+        }
+    }
     {
         const bool sel = j.mode != kAlphaGenOnly, ag = j.mode != kSelectionOnly;
         std::string err = resolveModels(j, sel, ag, ag && j.mode == kClean, ag && j.mode == kClean && j.objects.size() > 1);

@@ -25,6 +25,17 @@ bool writePNG(const std::wstring& path, const Frame& f, std::string& err);
 bool writePNG(const std::wstring& path, const Gray& g, std::string& err);
 bool writeEXR(const std::wstring& path, const Frame& f, std::string& err);
 bool writeEXR(const std::wstring& path, const Gray& g, std::string& err);
+
+struct ExrLayer {
+    std::string name;            // Nuke layer prefix (e.g. "hero", "car")
+    const Frame* rgb = nullptr;  // optional per-layer RGB (if null, uses baseRgb premultiplied by alpha)
+    const Gray* alpha = nullptr; // required per-layer alpha
+};
+
+// Write a multi-layer 16-bit half scanline EXR (base rgba + named <layer>.rgba channels).
+bool writeMultipassEXR(const std::wstring& path, const Frame* baseRgb, const Gray* baseAlpha,
+                       const std::vector<ExrLayer>& layers, std::string& err);
+
 bool writeImage(const std::wstring& path, const Frame& f, std::string& err);
 bool writeImage(const std::wstring& path, const Gray& g, std::string& err);
 
