@@ -423,7 +423,45 @@ std::string Server::cloudKeyHint() {
     return "..." + s.apiKey.substr(s.apiKey.size() > 4 ? s.apiKey.size() - 4 : 0);
 }
 
+static bool tryBridge(Server& out) {
+    Http h = requestUrl(false, "127.0.0.1", 8199, "GET", "/health", "", "", "");
+    if (h.status == 200) {
+        out = Server::fromUrl("http://127.0.0.1:8199");
+        out.cloud = true;
+        return true;
+    }
+    return false;
+}
+
 Server Server::cloudServer(std::string& err) {
+    Server bridge;
+    if (tryBridge(bridge)) {
+        return bridge;
+    }
+    // Try auto-launching the local loopback bridge if installed in ~/.nuke/python/comfygizmos/cloud_bridge.py
+    wchar_t* up = nullptr;
+    size_t upN = 0;
+    if (!_wdupenv_s(&up, &upN, L"USERPROFILE") && up) {
+        std::wstring script = std::wstring(up) + L"\\.nuke\\python\\comfygizmos\\cloud_bridge.py";
+        free(up);
+        if (GetFileAttributesW(script.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            std::wstring cmd = L"pythonw \"" + script + L"\"";
+            STARTUPINFOW si{};
+            PROCESS_INFORMATION pi{};
+            si.cb = sizeof(si);
+            if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) {
+                cmd = L"python \"" + script + L"\"";
+                CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr, &si, &pi);
+            }
+            if (pi.hProcess) CloseHandle(pi.hProcess);
+            if (pi.hThread) CloseHandle(pi.hThread);
+            for (int i = 0; i < 15; ++i) {
+                Sleep(100);
+                if (tryBridge(bridge)) return bridge;
+            }
+        }
+    }
+
     Server s = fromUrl("https://cloud.comfy.org");
     s.cloud = true;
     char* env = nullptr;
