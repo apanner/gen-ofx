@@ -99,9 +99,20 @@ struct Instance {
     OfxParamHandle session, anaStart, anaCount, cacheVersion;
     OfxParamHandle outputPath, detectPath, exportDir, spitRead, autoRead;
 
-    // viewer drag state (lives on the effect instance, shared by its overlay)
+    // viewer drag & HUD tool state (lives on the effect instance, shared by its overlay)
+    enum ToolMode { kToolOff = 0, kToolAdd = 1, kToolSub = 2, kToolErase = 3 };
     int dragIndex = -1;
     std::vector<VPoint> dragPoints;
+    int toolMode = kToolAdd;
+    int hoverBtn = -1;
+    bool overlayHidden = false;
+    bool hudCollapsed = false;
+    bool hoverValid = false;
+    double hoverCanonX = 0.0, hoverCanonY = 0.0;
+    bool hudValid = false;
+    int hudViewport[4] = {0, 0, 0, 0};
+    double hudModel[16] = {};
+    double hudProj[16] = {};
 
     std::mutex lock;
     std::map<std::string, std::shared_ptr<Gray>> cache;  // decoded/composed mattes
@@ -1734,62 +1745,401 @@ static void ring(double cx, double cy, double rx, double ry) {
     glEnd();
 }
 
+static bool canonicalToScreen(const Instance* inst, double ix, double iy, double& sxOut, double& syOut) {
+    if (!inst->hudValid || inst->hudViewport[2] <= 0 || inst->hudViewport[3] <= 0) return false;
+    const double* m = inst->hudModel;
+    const double* p = inst->hudProj;
+    double ex = m[0] * ix + m[4] * iy + m[12];
+    double ey = m[1] * ix + m[5] * iy + m[13];
+    double ez = m[2] * ix + m[6] * iy + m[14];
+    double ew = m[3] * ix + m[7] * iy + m[15];
+    double cx = p[0] * ex + p[4] * ey + p[8] * ez + p[12] * ew;
+    double cy = p[1] * ex + p[5] * ey + p[9] * ez + p[13] * ew;
+    double cw = p[3] * ex + p[7] * ey + p[11] * ez + p[15] * ew;
+    if (std::abs(cw) < 1e-9) return false;
+    double nx = cx / cw, ny = cy / cw;
+    sxOut = (nx * 0.5 + 0.5) * inst->hudViewport[2];
+    syOut = (ny * 0.5 + 0.5) * inst->hudViewport[3];
+    return true;
+}
+
+static void drawRoundedRect(double x, double y, double w, double h, double r, bool filled) {
+    const int seg = 5;
+    glBegin(filled ? GL_TRIANGLE_FAN : GL_LINE_LOOP);
+    if (filled) glVertex2d(x + w * 0.5, y + h * 0.5);
+    double cx[4] = {x + w - r, x + r, x + r, x + w - r};
+    double cy[4] = {y + h - r, y + h - r, y + r, y + r};
+    double a0[4] = {0.0, 1.5707963, 3.1415926, 4.7123889};
+    for (int c = 0; c < 4; ++c) {
+        for (int i = 0; i <= seg; ++i) {
+            double a = a0[c] + 1.5707963 * i / seg;
+            glVertex2d(cx[c] + r * std::cos(a), cy[c] + r * std::sin(a));
+        }
+    }
+    glEnd();
+}
+
+static void drawStrokeChar(double x, double y, double s, char ch) {
+    // Minimal 4x6 vector stroke font in screen pixels
+    auto seg = [&](double x0, double y0, double x1, double y1) {
+        glVertex2d(x + x0 * s, y + y0 * s);
+        glVertex2d(x + x1 * s, y + y1 * s);
+    };
+    ch = (char)std::toupper((unsigned char)ch);
+    glBegin(GL_LINES);
+    switch (ch) {
+        case 'A': seg(0,0, 2,6); seg(2,6, 4,0); seg(0.7,2.2, 3.3,2.2); break;
+        case 'B': seg(0,0, 0,6); seg(0,6, 3,6); seg(3,6, 4,5); seg(4,5, 3,3.2); seg(0,3.2, 3,3.2); seg(3,3.2, 4,2); seg(4,2, 3,0); seg(3,0, 0,0); break;
+        case 'C': seg(4,5, 3,6); seg(3,6, 1,6); seg(1,6, 0,5); seg(0,5, 0,1); seg(0,1, 1,0); seg(1,0, 3,0); seg(3,0, 4,1); break;
+        case 'D': seg(0,0, 0,6); seg(0,6, 3,6); seg(3,6, 4,4.5); seg(4,4.5, 4,1.5); seg(4,1.5, 3,0); seg(3,0, 0,0); break;
+        case 'E': seg(0,0, 0,6); seg(0,6, 4,6); seg(0,3, 3,3); seg(0,0, 4,0); break;
+        case 'F': seg(0,0, 0,6); seg(0,6, 4,6); seg(0,3, 3,3); break;
+        case 'G': seg(4,5, 3,6); seg(3,6, 1,6); seg(1,6, 0,5); seg(0,5, 0,1); seg(0,1, 1,0); seg(1,0, 3.5,0); seg(3.5,0, 4,1); seg(4,1, 4,3); seg(4,3, 2,3); break;
+        case 'H': seg(0,0, 0,6); seg(4,0, 4,6); seg(0,3, 4,3); break;
+        case 'I': seg(1,6, 3,6); seg(2,0, 2,6); seg(1,0, 3,0); break;
+        case 'J': seg(3,6, 3,1); seg(3,1, 2,0); seg(2,0, 1,0); seg(1,0, 0,1); break;
+        case 'K': seg(0,0, 0,6); seg(4,6, 0,3); seg(0,3, 4,0); break;
+        case 'L': seg(0,6, 0,0); seg(0,0, 4,0); break;
+        case 'M': seg(0,0, 0,6); seg(0,6, 2,3); seg(2,3, 4,6); seg(4,6, 4,0); break;
+        case 'N': seg(0,0, 0,6); seg(0,6, 4,0); seg(4,0, 4,6); break;
+        case 'O': seg(1,6, 3,6); seg(3,6, 4,5); seg(4,5, 4,1); seg(4,1, 3,0); seg(3,0, 1,0); seg(1,0, 0,1); seg(0,1, 0,5); seg(0,5, 1,6); break;
+        case 'P': seg(0,0, 0,6); seg(0,6, 3,6); seg(3,6, 4,5); seg(4,5, 4,3.5); seg(4,3.5, 3,3); seg(3,3, 0,3); break;
+        case 'R': seg(0,0, 0,6); seg(0,6, 3,6); seg(3,6, 4,5); seg(4,5, 4,3.5); seg(4,3.5, 3,3); seg(3,3, 0,3); seg(1.5,3, 4,0); break;
+        case 'S': seg(4,5, 3,6); seg(3,6, 1,6); seg(1,6, 0,5); seg(0,5, 0,3.5); seg(0,3.5, 4,2.5); seg(4,2.5, 4,1); seg(4,1, 3,0); seg(3,0, 1,0); seg(1,0, 0,1); break;
+        case 'T': seg(0,6, 4,6); seg(2,0, 2,6); break;
+        case 'U': seg(0,6, 0,1); seg(0,1, 1,0); seg(1,0, 3,0); seg(3,0, 4,1); seg(4,1, 4,6); break;
+        case 'V': seg(0,6, 2,0); seg(2,0, 4,6); break;
+        case 'W': seg(0,6, 1,0); seg(1,0, 2,3); seg(2,3, 3,0); seg(3,0, 4,6); break;
+        case 'X': seg(0,0, 4,6); seg(0,6, 4,0); break;
+        case 'Y': seg(0,6, 2,3); seg(4,6, 2,3); seg(2,3, 2,0); break;
+        case '1': seg(1,4.8, 2,6); seg(2,6, 2,0); seg(1,0, 3,0); break;
+        case '2': seg(0,4.8, 1,6); seg(1,6, 3,6); seg(3,6, 4,4.8); seg(4,4.8, 4,3.5); seg(4,3.5, 0,0); seg(0,0, 4,0); break;
+        case '3': seg(0,5, 1,6); seg(1,6, 3,6); seg(3,6, 4,5); seg(4,5, 3,3.2); seg(1.5,3.2, 3,3.2); seg(3,3.2, 4,2); seg(4,2, 3,0); seg(3,0, 1,0); seg(1,0, 0,1); break;
+        case '4': seg(3,0, 3,6); seg(3,6, 0,2); seg(0,2, 4,2); break;
+        case '5': seg(4,6, 0,6); seg(0,6, 0,3.5); seg(0,3.5, 3,3.5); seg(3,3.5, 4,2.5); seg(4,2.5, 4,1); seg(4,1, 3,0); seg(3,0, 0,0); break;
+        case '6': seg(3,6, 1,6); seg(1,6, 0,5); seg(0,5, 0,1); seg(0,1, 1,0); seg(1,0, 3,0); seg(3,0, 4,1); seg(4,1, 4,2.5); seg(4,2.5, 3,3.5); seg(3,3.5, 0,3.5); break;
+        case '+': seg(0.5,3, 3.5,3); seg(2,1.5, 2,4.5); break;
+        case '-': seg(0.5,3, 3.5,3); break;
+        case '(': seg(3,6, 1.5,4); seg(1.5,4, 1.5,2); seg(1.5,2, 3,0); break;
+        case ')': seg(1,6, 2.5,4); seg(2.5,4, 2.5,2); seg(2.5,2, 1,0); break;
+        case '/': seg(0,0, 4,6); break;
+        default: break;
+    }
+    glEnd();
+}
+
+static void drawStrokeText(double x, double y, double s, const std::string& txt) {
+    for (size_t i = 0; i < txt.size(); ++i) {
+        drawStrokeChar(x + i * 6.0 * s, y, s, txt[i]);
+    }
+}
+
+enum HudBtnId {
+    kBtnCollapse = 0,
+    kBtnAdd = 1,
+    kBtnSub = 2,
+    kBtnErase = 3,
+    kBtnOff = 4,
+    kBtnUndo = 5,
+    kBtnClear = 6,
+    kBtnPreview = 7,
+    kBtnToggleVis = 8,
+    kBtnSlotBase = 100  // 100..105 for slots 1..6
+};
+
+struct HudBtn {
+    int id;
+    double x, y, w, h;
+    std::string label;
+};
+
+static std::vector<HudBtn> buildHudButtons(const Instance* inst) {
+    std::vector<HudBtn> out;
+    if (!inst->hudValid) return out;
+    const double vh = (double)inst->hudViewport[3];
+    const double btnSz = 26.0, gap = 4.0, pad = 5.0;
+    double cx = 14.0 + pad;
+    const double cy = vh - 14.0 - pad - btnSz;
+
+    out.push_back({kBtnCollapse, cx, cy, 20.0, btnSz, inst->hudCollapsed ? "EXPAND" : "COLLAPSE"});
+    cx += 20.0 + gap;
+    if (inst->hudCollapsed) return out;
+
+    out.push_back({kBtnAdd, cx, cy, btnSz, btnSz, "SELECT (+)"}); cx += btnSz + gap;
+    out.push_back({kBtnSub, cx, cy, btnSz, btnSz, "MINUS (-)"}); cx += btnSz + gap;
+    out.push_back({kBtnErase, cx, cy, btnSz, btnSz, "ERASE (X)"}); cx += btnSz + gap;
+    out.push_back({kBtnOff, cx, cy, btnSz, btnSz, "PAN / OFF"}); cx += btnSz + gap + 6.0;
+
+    if (!inst->isCleanGen) {
+        for (int k = 0; k < kClickObjects; ++k) {
+            out.push_back({kBtnSlotBase + k, cx, cy, 22.0, btnSz, "OBJ " + std::to_string(k + 1)});
+            cx += 22.0 + 3.0;
+        }
+        cx += 5.0;
+    }
+
+    out.push_back({kBtnUndo, cx, cy, btnSz, btnSz, "UNDO"}); cx += btnSz + gap;
+    out.push_back({kBtnClear, cx, cy, btnSz, btnSz, "CLEAR"}); cx += btnSz + gap;
+    out.push_back({kBtnPreview, cx, cy, btnSz, btnSz, "PREVIEW"}); cx += btnSz + gap;
+    out.push_back({kBtnToggleVis, cx, cy, btnSz, btnSz, inst->overlayHidden ? "SHOW PTS" : "HIDE PTS"});
+    return out;
+}
+
+static void drawHudIcon(const HudBtn& b, const Instance* inst, int activeSlot) {
+    const double cx = b.x + b.w * 0.5, cy = b.y + b.h * 0.5;
+    glLineWidth(2.0f);
+    if (b.id == kBtnCollapse) {
+        glColor4f(0.82f, 0.86f, 0.92f, 0.95f);
+        glBegin(GL_LINES);
+        double dir = inst->hudCollapsed ? 1.0 : -1.0;
+        glVertex2d(cx - 2 * dir, cy + 4); glVertex2d(cx + 2 * dir, cy);
+        glVertex2d(cx + 2 * dir, cy); glVertex2d(cx - 2 * dir, cy - 4);
+        glEnd();
+    } else if (b.id == kBtnAdd) {
+        glColor4f(0.22f, 0.90f, 0.52f, 1.0f);
+        ring(cx, cy, 8.0, 8.0);
+        glBegin(GL_LINES);
+        glVertex2d(cx - 4.5, cy); glVertex2d(cx + 4.5, cy);
+        glVertex2d(cx, cy - 4.5); glVertex2d(cx, cy + 4.5);
+        glEnd();
+    } else if (b.id == kBtnSub) {
+        glColor4f(0.98f, 0.36f, 0.36f, 1.0f);
+        ring(cx, cy, 8.0, 8.0);
+        glBegin(GL_LINES);
+        glVertex2d(cx - 4.5, cy); glVertex2d(cx + 4.5, cy);
+        glEnd();
+    } else if (b.id == kBtnErase) {
+        glColor4f(0.98f, 0.74f, 0.22f, 1.0f);
+        glBegin(GL_LINES);
+        glVertex2d(cx - 5.0, cy - 5.0); glVertex2d(cx + 5.0, cy + 5.0);
+        glVertex2d(cx - 5.0, cy + 5.0); glVertex2d(cx + 5.0, cy - 5.0);
+        glEnd();
+    } else if (b.id == kBtnOff) {
+        glColor4f(0.85f, 0.88f, 0.94f, 0.95f);
+        glBegin(GL_LINE_LOOP);
+        glVertex2d(cx - 4.0, cy + 6.0);
+        glVertex2d(cx - 4.0, cy - 5.0);
+        glVertex2d(cx - 1.0, cy - 2.0);
+        glVertex2d(cx + 2.5, cy - 6.0);
+        glVertex2d(cx + 4.5, cy - 4.5);
+        glVertex2d(cx + 1.0, cy - 0.5);
+        glVertex2d(cx + 5.0, cy - 0.5);
+        glEnd();
+    } else if (b.id >= kBtnSlotBase && b.id < kBtnSlotBase + kClickObjects) {
+        int slot = b.id - kBtnSlotBase;
+        const float* col = kTint[slot % 12];
+        bool isAct = (slot + 1 == activeSlot);
+        glColor4f(col[0], col[1], col[2], isAct ? 0.95f : 0.42f);
+        disc(cx, cy, 8.0, 8.0);
+        if (isAct) {
+            glColor4f(1.0f, 1.0f, 1.0f, 0.98f);
+            glLineWidth(1.6f);
+            ring(cx, cy, 9.2, 9.2);
+        }
+        glColor4f(0.05f, 0.06f, 0.08f, 1.0f);
+        glLineWidth(1.8f);
+        drawStrokeChar(cx - 2.6, cy - 4.0, 1.35, (char)('1' + slot));
+    } else if (b.id == kBtnUndo) {
+        glColor4f(0.75f, 0.85f, 0.98f, 0.95f);
+        glBegin(GL_LINE_STRIP);
+        glVertex2d(cx - 5.0, cy + 2.0);
+        glVertex2d(cx + 2.0, cy + 2.0);
+        glVertex2d(cx + 5.0, cy);
+        glVertex2d(cx + 5.0, cy - 4.0);
+        glVertex2d(cx - 3.0, cy - 4.0);
+        glEnd();
+        glBegin(GL_LINES);
+        glVertex2d(cx - 5.0, cy + 2.0); glVertex2d(cx - 2.0, cy + 5.0);
+        glVertex2d(cx - 5.0, cy + 2.0); glVertex2d(cx - 2.0, cy - 1.0);
+        glEnd();
+    } else if (b.id == kBtnClear) {
+        glColor4f(0.95f, 0.45f, 0.45f, 0.95f);
+        glBegin(GL_LINE_LOOP);
+        glVertex2d(cx - 4.5, cy + 4.0); glVertex2d(cx + 4.5, cy + 4.0);
+        glVertex2d(cx + 3.5, cy - 5.5); glVertex2d(cx - 3.5, cy - 5.5);
+        glEnd();
+        glBegin(GL_LINES);
+        glVertex2d(cx - 6.0, cy + 4.0); glVertex2d(cx + 6.0, cy + 4.0);
+        glVertex2d(cx - 2.0, cy + 6.0); glVertex2d(cx + 2.0, cy + 6.0);
+        glEnd();
+    } else if (b.id == kBtnPreview) {
+        glColor4f(0.25f, 0.85f, 1.0f, 1.0f);
+        glBegin(GL_TRIANGLES);
+        glVertex2d(cx - 4.0, cy + 6.0);
+        glVertex2d(cx - 4.0, cy - 6.0);
+        glVertex2d(cx + 6.0, cy);
+        glEnd();
+    } else if (b.id == kBtnToggleVis) {
+        glColor4f(inst->overlayHidden ? 0.55f : 0.90f, inst->overlayHidden ? 0.55f : 0.95f, 1.0f, 0.95f);
+        ring(cx, cy, 7.5, 4.8);
+        disc(cx, cy, 2.5, 2.5);
+        if (inst->overlayHidden) {
+            glColor4f(0.98f, 0.36f, 0.36f, 1.0f);
+            glBegin(GL_LINES);
+            glVertex2d(cx - 6.5, cy - 5.5); glVertex2d(cx + 6.5, cy + 5.5);
+            glEnd();
+        }
+    }
+}
+
 static OfxStatus overlayDraw(const void* handle, OfxPropertySetHandle inArgs) {
     Instance* inst = overlayInstance(handle);
     if (!inst) return kOfxStatReplyDefault;
     double t = 0, sx, sy;
     gProp->propGetDouble(inArgs, kOfxPropTime, 0, &t);
     pixelScale(handle, inArgs, sx, sy);
+
+    glGetIntegerv(GL_VIEWPORT, inst->hudViewport);
+    glGetDoublev(GL_MODELVIEW_MATRIX, inst->hudModel);
+    glGetDoublev(GL_PROJECTION_MATRIX, inst->hudProj);
+    inst->hudValid = (inst->hudViewport[2] > 0 && inst->hudViewport[3] > 0);
+
     std::vector<VPoint> pts = inst->dragIndex >= 0 ? inst->dragPoints : parsePoints(getString(inst->points));
-    if (pts.empty()) return kOfxStatOK;
     const int frame = (int)std::lround(t);
     const int activeSlot = std::clamp(getInt(inst->activeObject) + 1, 1, kClickObjects);
+
     glPushAttrib(GL_ALL_ATTRIB_BITS);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_LINE_SMOOTH);
-    for (size_t i = 0; i < pts.size(); ++i) {
-        const VPoint& p = pts[i];
-        const bool isActive = (p.obj == activeSlot);
-        const double R = isActive ? 9.5 : 8.0;  // active object points are slightly larger
-        const float alpha = isActive ? 1.0f : 0.78f;
-        const bool live = false;  // every frame's points count (keyframes); other frames show as rings
-        if (p.frame != frame) {  // a key on another frame: thin ring only
-            glLineWidth(isActive ? 2.0f : 1.5f);
-            const float* col = p.positive ? kTint[(p.obj - 1) % 12] : nullptr;
-            if (col) glColor4f(col[0], col[1], col[2], live ? 0.9f : (isActive ? 0.48f : 0.28f));
-            else glColor4f(1.f, 0.35f, 0.3f, live ? 0.9f : 0.35f);
-            ring(p.x, p.y, R * sx, R * sy);
-            continue;
+
+    if (!inst->overlayHidden) {
+        for (size_t i = 0; i < pts.size(); ++i) {
+            const VPoint& p = pts[i];
+            const bool isActive = (p.obj == activeSlot);
+            const double R = isActive ? 9.5 : 8.0;
+            const float alpha = isActive ? 1.0f : 0.78f;
+            if (p.frame != frame) {
+                glLineWidth(isActive ? 2.0f : 1.5f);
+                const float* col = p.positive ? kTint[(p.obj - 1) % 12] : nullptr;
+                if (col) glColor4f(col[0], col[1], col[2], isActive ? 0.48f : 0.28f);
+                else glColor4f(1.f, 0.35f, 0.3f, 0.35f);
+                ring(p.x, p.y, R * sx, R * sy);
+                continue;
+            }
+            const float* col = kTint[(p.obj - 1) % 12];
+            glColor4f(0.f, 0.f, 0.f, 0.85f);
+            disc(p.x, p.y, (R + 3) * sx, (R + 3) * sy);
+            if (isActive) {
+                glLineWidth(1.5f);
+                glColor4f(1.f, 1.f, 1.f, 0.9f);
+                ring(p.x, p.y, (R + 4.5) * sx, (R + 4.5) * sy);
+            }
+            if (p.positive) {
+                glColor4f(col[0], col[1], col[2], alpha);
+                disc(p.x, p.y, R * sx, R * sy);
+            } else {
+                glColor4f(col[0], col[1], col[2], alpha);
+                disc(p.x, p.y, R * sx, R * sy);
+                glColor4f(1.f, 0.25f, 0.2f, alpha);
+                disc(p.x, p.y, (R - 3) * sx, (R - 3) * sy);
+            }
+            glColor4f(0.f, 0.f, 0.f, 1.f);
+            glLineWidth(2.5f);
+            glBegin(GL_LINES);
+            glVertex2d(p.x - 5 * sx, p.y);
+            glVertex2d(p.x + 5 * sx, p.y);
+            if (p.positive) {
+                glVertex2d(p.x, p.y - 5 * sy);
+                glVertex2d(p.x, p.y + 5 * sy);
+            }
+            glEnd();
         }
-        const float* col = kTint[(p.obj - 1) % 12];
-        glColor4f(0.f, 0.f, 0.f, 0.85f);  // dark halo so it reads on any plate
-        disc(p.x, p.y, (R + 3) * sx, (R + 3) * sy);
-        if (isActive) {
-            glLineWidth(1.5f);
-            glColor4f(1.f, 1.f, 1.f, 0.9f);
-            ring(p.x, p.y, (R + 4.5) * sx, (R + 4.5) * sy);
-        }
-        if (p.positive) {
-            glColor4f(col[0], col[1], col[2], alpha);  // the click object's colour
-            disc(p.x, p.y, R * sx, R * sy);
-        } else {  // exclude: red, ringed in the object's colour
-            glColor4f(col[0], col[1], col[2], alpha);
-            disc(p.x, p.y, R * sx, R * sy);
-            glColor4f(1.f, 0.25f, 0.2f, alpha);
-            disc(p.x, p.y, (R - 3) * sx, (R - 3) * sy);
-        }
-        glColor4f(0.f, 0.f, 0.f, 1.f);  // + / - glyph
-        glLineWidth(2.5f);
+    }
+
+    // Live cursor badge when hovering over the plate with an active tool
+    if (inst->hoverValid && inst->hoverBtn < 0 && inst->toolMode != Instance::kToolOff && inst->dragIndex < 0) {
+        const float* col = kTint[(activeSlot - 1) % 12];
+        double cx = inst->hoverCanonX, cy = inst->hoverCanonY;
+        glLineWidth(1.6f);
+        if (inst->toolMode == Instance::kToolAdd) glColor4f(col[0], col[1], col[2], 0.85f);
+        else if (inst->toolMode == Instance::kToolSub) glColor4f(0.98f, 0.36f, 0.36f, 0.9f);
+        else glColor4f(0.98f, 0.74f, 0.22f, 0.9f);
+        ring(cx, cy, 11.0 * sx, 11.0 * sy);
         glBegin(GL_LINES);
-        glVertex2d(p.x - 5 * sx, p.y);
-        glVertex2d(p.x + 5 * sx, p.y);
-        if (p.positive) {
-            glVertex2d(p.x, p.y - 5 * sy);
-            glVertex2d(p.x, p.y + 5 * sy);
+        if (inst->toolMode == Instance::kToolErase) {
+            glVertex2d(cx - 4 * sx, cy - 4 * sy); glVertex2d(cx + 4 * sx, cy + 4 * sy);
+            glVertex2d(cx - 4 * sx, cy + 4 * sy); glVertex2d(cx + 4 * sx, cy - 4 * sy);
+        } else {
+            glVertex2d(cx - 4.5 * sx, cy); glVertex2d(cx + 4.5 * sx, cy);
+            if (inst->toolMode == Instance::kToolAdd) {
+                glVertex2d(cx, cy - 4.5 * sy); glVertex2d(cx, cy + 4.5 * sy);
+            }
         }
         glEnd();
     }
+
+    // Screen-space Viewer Toolbar HUD
+    auto btns = buildHudButtons(inst);
+    if (!btns.empty()) {
+        glMatrixMode(GL_PROJECTION);
+        glPushMatrix();
+        glLoadIdentity();
+        glOrtho(0.0, (double)inst->hudViewport[2], 0.0, (double)inst->hudViewport[3], -1.0, 1.0);
+        glMatrixMode(GL_MODELVIEW);
+        glPushMatrix();
+        glLoadIdentity();
+
+        const double pad = 5.0;
+        const double barX = 14.0;
+        const double barY = btns.front().y - pad;
+        const double barW = (btns.back().x + btns.back().w + pad) - barX;
+        const double barH = btns.front().h + pad * 2.0;
+
+        glColor4f(0.08f, 0.09f, 0.11f, 0.86f);
+        drawRoundedRect(barX, barY, barW, barH, 6.0, true);
+        glLineWidth(1.2f);
+        glColor4f(1.0f, 1.0f, 1.0f, 0.16f);
+        drawRoundedRect(barX, barY, barW, barH, 6.0, false);
+
+        std::string tipText;
+        for (const auto& b : btns) {
+            const bool isHover = (inst->hoverBtn == b.id);
+            const bool isToolAct =
+                (b.id == kBtnAdd && inst->toolMode == Instance::kToolAdd) ||
+                (b.id == kBtnSub && inst->toolMode == Instance::kToolSub) ||
+                (b.id == kBtnErase && inst->toolMode == Instance::kToolErase) ||
+                (b.id == kBtnOff && inst->toolMode == Instance::kToolOff);
+
+            if (isToolAct) {
+                if (b.id == kBtnAdd) glColor4f(0.14f, 0.42f, 0.28f, 0.88f);
+                else if (b.id == kBtnSub) glColor4f(0.45f, 0.16f, 0.16f, 0.88f);
+                else if (b.id == kBtnErase) glColor4f(0.42f, 0.32f, 0.12f, 0.88f);
+                else glColor4f(0.24f, 0.27f, 0.33f, 0.88f);
+                drawRoundedRect(b.x, b.y, b.w, b.h, 4.5, true);
+                glColor4f(1.0f, 1.0f, 1.0f, 0.45f);
+                glLineWidth(1.2f);
+                drawRoundedRect(b.x, b.y, b.w, b.h, 4.5, false);
+            } else if (isHover) {
+                glColor4f(1.0f, 1.0f, 1.0f, 0.14f);
+                drawRoundedRect(b.x, b.y, b.w, b.h, 4.5, true);
+            }
+            drawHudIcon(b, inst, activeSlot);
+            if (isHover) tipText = b.label;
+        }
+
+        if (tipText.empty() && !inst->hudCollapsed) {
+            if (inst->toolMode == Instance::kToolAdd) tipText = "SELECT (+)";
+            else if (inst->toolMode == Instance::kToolSub) tipText = "MINUS (-)";
+            else if (inst->toolMode == Instance::kToolErase) tipText = "ERASE (X)";
+            else tipText = "PAN / CTRL+CLICK";
+        }
+        if (!tipText.empty()) {
+            const double tx = barX + barW + 8.0;
+            const double tw = tipText.size() * 7.8 + 14.0;
+            glColor4f(0.08f, 0.09f, 0.11f, 0.82f);
+            drawRoundedRect(tx, barY + 4.0, tw, barH - 8.0, 4.0, true);
+            glColor4f(0.88f, 0.92f, 0.96f, 0.95f);
+            glLineWidth(1.4f);
+            drawStrokeText(tx + 7.0, barY + 13.0, 1.3, tipText);
+        }
+
+        glPopMatrix();
+        glMatrixMode(GL_PROJECTION);
+        glPopMatrix();
+        glMatrixMode(GL_MODELVIEW);
+    }
+
     glPopAttrib();
     return kOfxStatOK;
 }
@@ -1816,6 +2166,16 @@ static void commitPoints(OfxImageEffectHandle effect, Instance* inst, const std:
     gParam->paramEditEnd(ps);
 }
 
+static int hitHudButton(const Instance* inst, double sxPos, double syPos) {
+    auto btns = buildHudButtons(inst);
+    for (const auto& b : btns) {
+        if (sxPos >= b.x && sxPos <= b.x + b.w && syPos >= b.y && syPos <= b.y + b.h) {
+            return b.id;
+        }
+    }
+    return -1;
+}
+
 static OfxStatus overlayPen(const char* action, const void* handle, OfxPropertySetHandle inArgs) {
     OfxImageEffectHandle effect = nullptr;
     Instance* inst = overlayInstance(handle, &effect);
@@ -1826,9 +2186,76 @@ static OfxStatus overlayPen(const char* action, const void* handle, OfxPropertyS
     pixelScale(handle, inArgs, sx, sy);
     const int frame = (int)std::lround(t);
 
+    double screenX = 0.0, screenY = 0.0;
+    const bool hasScreen = canonicalToScreen(inst, pos[0], pos[1], screenX, screenY);
+    const int hudHit = hasScreen ? hitHudButton(inst, screenX, screenY) : -1;
+
+    if (!strcmp(action, kOfxInteractActionPenMotion)) {
+        inst->hoverValid = true;
+        inst->hoverCanonX = pos[0];
+        inst->hoverCanonY = pos[1];
+        inst->hoverBtn = hudHit;
+        if (inst->dragIndex >= 0 && inst->dragIndex < (int)inst->dragPoints.size()) {
+            inst->dragPoints[inst->dragIndex].x = pos[0];
+            inst->dragPoints[inst->dragIndex].y = pos[1];
+        }
+        gInteract->interactRedraw((OfxInteractHandle)handle);
+        return inst->dragIndex >= 0 ? kOfxStatOK : kOfxStatReplyDefault;
+    }
+
     if (!strcmp(action, kOfxInteractActionPenDown)) {
+        if (hudHit >= 0) {
+            if (hudHit == kBtnCollapse) {
+                inst->hudCollapsed = !inst->hudCollapsed;
+            } else if (hudHit == kBtnAdd) {
+                inst->toolMode = Instance::kToolAdd;
+            } else if (hudHit == kBtnSub) {
+                inst->toolMode = Instance::kToolSub;
+            } else if (hudHit == kBtnErase) {
+                inst->toolMode = Instance::kToolErase;
+            } else if (hudHit == kBtnOff) {
+                inst->toolMode = Instance::kToolOff;
+            } else if (hudHit >= kBtnSlotBase && hudHit < kBtnSlotBase + kClickObjects) {
+                gParam->paramSetValue(inst->activeObject, hudHit - kBtnSlotBase);
+                if (inst->toolMode == Instance::kToolOff) inst->toolMode = Instance::kToolAdd;
+            } else if (hudHit == kBtnUndo) {
+                std::vector<VPoint> pts = parsePoints(getString(inst->points));
+                if (!pts.empty()) {
+                    int idx = -1;
+                    for (int i = (int)pts.size() - 1; i >= 0; --i) {
+                        if (pts[i].frame == frame) { idx = i; break; }
+                    }
+                    if (idx < 0) idx = (int)pts.size() - 1;
+                    pts.erase(pts.begin() + idx);
+                    commitPoints(effect, inst, pts, "Undo point");
+                }
+            } else if (hudHit == kBtnClear) {
+                std::vector<VPoint> pts = parsePoints(getString(inst->points));
+                if (!pts.empty()) {
+                    if (keyDown(VK_SHIFT)) {
+                        pts.clear();
+                    } else {
+                        size_t before = pts.size();
+                        pts.erase(std::remove_if(pts.begin(), pts.end(),
+                                                 [frame](const VPoint& p) { return p.frame == frame; }),
+                                  pts.end());
+                        if (pts.size() == before) pts.clear();
+                    }
+                    commitPoints(effect, inst, pts, "Clear points");
+                }
+            } else if (hudHit == kBtnPreview) {
+                startPreview(effect, inst, t, false);
+            } else if (hudHit == kBtnToggleVis) {
+                inst->overlayHidden = !inst->overlayHidden;
+            }
+            gInteract->interactRedraw((OfxInteractHandle)handle);
+            return kOfxStatOK;
+        }
+
         std::vector<VPoint> pts = parsePoints(getString(inst->points));
         int hit = nearestPoint(pts, pos[0], pos[1], sx, sy, frame);
+
+        // Ctrl+Click / Ctrl+Shift+Click always adds +/- point regardless of active tool
         if (keyDown(VK_CONTROL)) {
             int activeSlot = std::clamp(getInt(inst->activeObject) + 1, 1, kClickObjects);
             VPoint p;
@@ -1842,27 +2269,46 @@ static OfxStatus overlayPen(const char* action, const void* handle, OfxPropertyS
             gInteract->interactRedraw((OfxInteractHandle)handle);
             return kOfxStatOK;
         }
-        if (hit >= 0 && keyDown(VK_MENU)) {  // Alt+click a dot: delete it
+        // Alt+Click or Erase tool deletes clicked dot
+        if (hit >= 0 && (keyDown(VK_MENU) || inst->toolMode == Instance::kToolErase)) {
             pts.erase(pts.begin() + hit);
             commitPoints(effect, inst, pts, "Delete point");
             gInteract->interactRedraw((OfxInteractHandle)handle);
             return kOfxStatOK;
         }
-        if (hit >= 0) {  // start dragging a dot
+        // Drag an existing dot
+        if (hit >= 0) {
             inst->dragIndex = hit;
             inst->dragPoints = pts;
             return kOfxStatOK;
         }
+        // Active Select (+) or Minus (-) tool adds a point on plain Left-Click
+        if (inst->toolMode == Instance::kToolAdd || inst->toolMode == Instance::kToolSub) {
+            int activeSlot = std::clamp(getInt(inst->activeObject) + 1, 1, kClickObjects);
+            VPoint p;
+            p.x = pos[0];
+            p.y = pos[1];
+            p.positive = (inst->toolMode == Instance::kToolAdd);
+            p.frame = frame;
+            p.obj = activeSlot;
+            pts.push_back(p);
+            commitPoints(effect, inst, pts, p.positive ? "Add point" : "Add exclude point");
+            gInteract->interactRedraw((OfxInteractHandle)handle);
+            return kOfxStatOK;
+        }
         return kOfxStatReplyDefault;
     }
+
     if (inst->dragIndex < 0) return kOfxStatReplyDefault;
-    inst->dragPoints[inst->dragIndex].x = pos[0];
-    inst->dragPoints[inst->dragIndex].y = pos[1];
+    if (inst->dragIndex < (int)inst->dragPoints.size()) {
+        inst->dragPoints[inst->dragIndex].x = pos[0];
+        inst->dragPoints[inst->dragIndex].y = pos[1];
+    }
     gInteract->interactRedraw((OfxInteractHandle)handle);
     if (!strcmp(action, kOfxInteractActionPenUp)) {
         std::vector<VPoint> pts = inst->dragPoints;
         inst->dragIndex = -1;
-        commitPoints(effect, inst, pts, "Move point");  // the preview refreshes once, on release
+        commitPoints(effect, inst, pts, "Move point");
     }
     return kOfxStatOK;
 }
